@@ -3,3 +3,11 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# KiCad local state, caches, and automatic backups
+*.lck
+*.kicad_prl
+fp-info-cache
+*-backups/
+.history/
+.DS_Store
