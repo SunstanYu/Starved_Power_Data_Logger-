@@ -1,6 +1,19 @@
-# Name,   Type, SubType, Offset,  Size,   Flags
+# ESP32-S3 8MB flash —— 双 OTA 槽 + 本地 FAT + 崩溃现场
+#
+# 原方案抄自 Arduino 的 default_ffat.csv（4MB 板子用的），只改了一行：
+# 删掉 coredump 把 64KB 给 FFat。两个后果当时没意识到：
+#   ① 整张表只用到 0x400000 = 4MB，芯片是 8MB —— 一半 flash 从没被寻址
+#   ② Arduino 核心其实启用了 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH，
+#      崩溃现场本该写进 flash（不走串口，所以 CDC 随固件崩也没关系），
+#      但分区没了 = 无处可写，而且是【静默失败】
+#
+# 实测固件 1,074,233 字节：旧 app 分区 1.25MB → 占用 81.8%，
+# 做不了 OTA（升级代码本身几十 KB，且新固件必须塞得进另一个槽）。
+#
+# Name,   Type, SubType, Offset,  Size,     说明
 nvs,      data, nvs,     0x9000,  0x5000,
 otadata,  data, ota,     0xe000,  0x2000,
-app0,     app,  ota_0,   0x10000, 0x140000,
-app1,     app,  ota_1,   0x150000,0x140000,
-ffat,     data, fat,     0x290000,0x170000,
+app0,     app,  ota_0,   0x10000, 0x300000,
+app1,     app,  ota_1,   0x310000,0x300000,
+ffat,     data, fat,     0x610000,0x1E0000,
+coredump, data, coredump,0x7F0000,0x10000,

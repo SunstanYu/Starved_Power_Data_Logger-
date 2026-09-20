@@ -11,3 +11,4 @@ fp-info-cache
 *-backups/
 .history/
 .DS_Store
+partitions.csv.bak-4mb
