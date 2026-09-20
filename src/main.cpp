@@ -48,6 +48,48 @@ const float BATTERY_LOW_THRESHOLD_V = 4.0f;
 // extern：C++ 里命名空间作用域的 const 默认是【内部链接】，
 // 不加 extern 的话 tasks.cpp 链接时找不到它。
 extern const float BATTERY_CUTOFF_V = 3.7f;
+
+// ★ A5 修（2026-09-20 上板实测发现）
+//
+// 【现象】把固件烧进一块【没接电池】的裸板，上电不到 1 秒就永久睡死，
+// USB 从系统里彻底消失，esptool 也够不着，只能按 RESET 救。
+//
+// 【原因】判据写的是 `batteryMv > 0`，本意是「读数有效」。
+// 但 batteryAdcPin 悬空时 ADC 不读 0 —— 它读到的是几百 mV 的噪声。
+// 于是 `> 0 && < 3700` 成立，节点认为自己没电了，执行永久停机。
+//
+// 【为什么这在田里是致命的】分压电阻虚焊、接插件松动、电池仓接触不良 ——
+// 任何一种都会让 ADC 悬空，节点就把自己变成砖，而且【没有唤醒源】，
+// 必须有人走到田里按复位。本来是保护数据的机制，变成了失效机制。
+//
+// 两道闸：
+//   ① 合理性下限：4 节 AA 经 ÷3 分压，哪怕快没电也在 3V 以上。
+//      读到低于 1V 说明【没接电池 / ADC 悬空】，不是「电池空了」。
+//   ② 连续判定：单次 ADC 毛刺不该让一个田间节点停机。
+const int BATTERY_SANITY_FLOOR_MV = 1000;   // 低于此值 = 读数不可信，不是低电量
+const int BATTERY_LOW_STREAK = 3;           // 连续 3 次低于阈值才认
+
+// 返回 true 表示「确实该停机了」。
+bool batteryShouldShutdown(int batteryMv) {
+  static int streak = 0;
+
+  if (batteryMv < BATTERY_SANITY_FLOOR_MV) {
+    if (streak) { streak = 0; }
+    Serial.printf("[BAT] %d mV below sanity floor -> treating as NO BATTERY, not low battery\n",
+                  batteryMv);
+    return false;                       // 悬空 / 没接电池，绝不停机
+  }
+  if (batteryMv >= (int)(BATTERY_CUTOFF_V * 1000)) {
+    streak = 0;
+    return false;
+  }
+  if (++streak < BATTERY_LOW_STREAK) {
+    Serial.printf("[BAT] %d mV below cutoff (%d/%d) — waiting for confirmation\n",
+                  batteryMv, streak, BATTERY_LOW_STREAK);
+    return false;
+  }
+  return true;
+}
 DHTesp dht;
 SfeAS7343ArdI2C spectralSensor;
 uint16_t spectralChannels[ksfAS7343NumChannels];
@@ -91,8 +133,10 @@ extern "C" bool verifyOta() {
   }
   SD.end();
 
+  // 同一个坑：`mv > 0` 挡不住悬空 ADC。分压虚焊会让每次 OTA 都无条件回滚，
+  // 而回滚是【静默】的 —— 你只会看到"升级没生效"，查不到为什么。
   int mv = getBatteryMv();
-  if (mv > 0 && mv < (int)(BATTERY_CUTOFF_V * 1000)) {
+  if (mv >= BATTERY_SANITY_FLOOR_MV && mv < (int)(BATTERY_CUTOFF_V * 1000)) {
     Serial.printf("[OTA] FAIL: battery %d mV too low -> rollback\n", mv);
     return false;                          // 电量不够撑过验证期，别冒险留在新版
   }
@@ -108,7 +152,17 @@ void enterLowBatteryShutdown(int batteryMv) {
   digitalWrite(batteryLedPin, HIGH);
   setPeripheralSwitches(false);          // 先断外设，减少残余放电
   Serial.flush();
-  esp_deep_sleep_start();                // 无定时唤醒源 = 不会再自己醒
+
+  // ★ 改：留一个【很长周期】的定时唤醒，而不是彻底不醒。
+  //
+  // 原设计是无唤醒源，理由是「不会再自己醒来采样」。但那等于
+  // 把「需要人工干预」写死进固件 —— 而碱性电池在低温下电压会回升，
+  // 白天升温后可能又能撑一阵；分压虚焊修好后也该能自己恢复。
+  //
+  // 6 小时醒一次只是读个 ADC 再睡，占空比接近 0，
+  // 对续航的影响可以忽略，换来的是【可恢复】。
+  esp_sleep_enable_timer_wakeup(6ULL * 3600ULL * 1000000ULL);
+  esp_deep_sleep_start();
 }
 
 // ★ A6：资源水位。诊断「跑久了会不会崩」只能靠这个，不能靠推测。
@@ -852,7 +906,7 @@ void loop() {
 
     int moisture = getMoisture();
     int batteryMv = getBatteryMv();
-    if (batteryMv > 0 && batteryMv < (int)(BATTERY_CUTOFF_V * 1000)) {
+    if (batteryShouldShutdown(batteryMv)) {
       enterLowBatteryShutdown(batteryMv);   // 在写卡【之前】判，确保还有电落盘
     }
     float temperatureC = 0.0f;

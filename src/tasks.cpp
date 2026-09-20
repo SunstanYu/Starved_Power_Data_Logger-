@@ -60,6 +60,7 @@ extern void setPeripheralSwitches(bool enabled);
 extern void logResourceWatermark(const char* tag);
 extern void enterLowBatteryShutdown(int batteryMv);
 extern const float BATTERY_CUTOFF_V;
+extern bool batteryShouldShutdown(int batteryMv);
 extern uint16_t spectralChannels[];
 
 // ---------------------------------------------------------------- 参数
@@ -165,7 +166,7 @@ static void sensorTask(void*) {
       Serial.println("[TASK] record queue full, dropped oldest");
     }
 
-    if (batteryMv > 0 && batteryMv < (int)(BATTERY_CUTOFF_V * 1000)) {
+    if (batteryShouldShutdown(batteryMv)) {
       // ★ 先拿存储锁再停机。storage 任务可能正写到一半 ——
       // 直接 esp_deep_sleep_start() 会在写入中途掐断电，
       // 损坏的恰恰是 A5 本来要保护的那份数据。
