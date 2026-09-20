@@ -149,7 +149,13 @@ static String buildPageHead() {
 
 static String buildPageTail() {
   return F("</ul><p class='muted'>Refresh the page to load the latest sample "
-           "from storage.</p></section></section></main></body></html>");
+           "from storage.</p></section></section></main>"
+           // 打开页面即对时：设备没有 RTC 也没有网络，浏览器是唯一时间源
+           "<script>"
+           "fetch('/settime?epoch='+Math.floor(Date.now()/1000))"
+           ".then(r=>r.text()).then(t=>console.log('clock sync:',t))"
+           ".catch(e=>console.log('clock sync failed',e));"
+           "</script></body></html>");
 }
 
 // ★ A1：分块发送，不再把整页拼成一个 String。
@@ -161,6 +167,37 @@ static String buildPageTail() {
 // 现在：Content-Length 未知 → 先发头 → 逐行发历史 → 发尾。
 // 峰值内存从 O(日志大小) 降到 O(单行)。
 static void emitChunk(const String& s) { server.sendContent(s); }
+
+// ★ A3：浏览器对时。
+//
+// 【问题】记录里格式化时间戳的分支永远不执行——因为条件是
+// `now > 1700000000`，而全项目【没有任何地方设过系统时钟】。
+// 实际写进文件的只有 time_ms=millis()，而 millis() 每次 deep sleep
+// 醒来都从 0 重数。靠 sampleCounter 能反推相对时间，但没有绝对时间——
+// 农业数据的日变化曲线画不出来。
+//
+// 【为什么不用 NTP】田里没有网络回传，设备自己是 AP 不是 STA。
+// 【为什么不加 RTC 芯片】要改 PCB。
+//
+// 【解法】用户的手机就是唯一会来的那个设备。他打开仪表盘时，
+// 网页上的 JS 顺手把浏览器时间回传，设备 settimeofday()。
+// ESP32 的 RTC 在 deep sleep 期间继续走，对一次能撑很久
+// （晶振漂移大约每天几秒）。零硬件成本。
+static void handleSetTime() {
+  if (!server.hasArg("epoch")) {
+    server.send(400, "text/plain", "missing epoch");
+    return;
+  }
+  long long epoch = atoll(server.arg("epoch").c_str());
+  if (epoch < 1700000000LL) {                 // 2023-11 之前的值一律拒绝
+    server.send(400, "text/plain", "implausible epoch");
+    return;
+  }
+  struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+  settimeofday(&tv, nullptr);
+  Serial.printf("[TIME] clock set from browser: %lld\n", epoch);
+  server.send(200, "text/plain", "ok");
+}
 
 static void handleRoot() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -185,6 +222,7 @@ void displayGatewaySetup() {
   Serial.printf("[DISPLAY] Open: http://%s/\n", ip.toString().c_str());
 
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/settime", HTTP_GET, handleSetTime);
   server.begin();
   Serial.println("[DISPLAY] HTTP server started.");
 }

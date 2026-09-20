@@ -353,6 +353,10 @@ String buildMeasurementRecord(
   record += dhtOk ? String(humidity, 1) : String("nan");
   record += ",dht_q=";
   record += dhtOk ? "ok" : "read_fail";
+  // ★ A3：时钟来源。没对过时只有相对时间（time_ms + 采样序号），
+  // 下游据此判断 time= 字段可不可信，而不是看到有值就当真。
+  record += ",clk=";
+  record += (now > 1700000000) ? "synced" : "uptime_only";
   record += ",spectral=";
   if (channelCount > 0) {
     for (int i = 0; i < channelCount; i++) {
