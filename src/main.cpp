@@ -61,6 +61,42 @@ RTC_DATA_ATTR uint32_t sampleCounter = 0;
 
 // ====================== HELPERS ======================
 
+// ★ A10：OTA 回滚自检。
+//
+// Arduino 核心已启用 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE：新固件首次
+// 启动时处于 PENDING_VERIFY 状态，initArduino() 会调 verifyOta()——
+// 返回 true 就 mark_app_valid 确认，返回 false 就【自动回滚并重启】到旧分区。
+//
+// 但核心里的 verifyOta() 是 weak 函数，默认无条件 `return true`：
+// 只要新固件能跑到 initArduino() 就算通过。这挡得住「根本起不来」，
+// 挡不住「能起来但功能坏了」。
+//
+// 对一个埋在田里、回收成本极高的节点，这个区别是致命的——
+// 刷坏了就是报废，没有第二次机会。所以覆盖它，做真实自检。
+//
+// ⚠️ 核心注释提醒：这函数在启动早期跑，要短、不要阻塞太久。
+// 所以这里只做「能不能起来」级别的检查，不碰 2.5s 的 DHT11 时序。
+extern "C" bool verifyOta() {
+  Serial.println("[OTA] verifying new image...");
+
+  pinMode(SDcardPin, OUTPUT);
+  digitalWrite(SDcardPin, HIGH);
+  if (!SD.begin(SDcardPin, SPI, 1000000)) {
+    Serial.println("[OTA] FAIL: SD not available -> rollback");
+    return false;                          // 存储起不来 = 数据会丢，不如退回
+  }
+  SD.end();
+
+  int mv = getBatteryMv();
+  if (mv > 0 && mv < (int)(BATTERY_CUTOFF_V * 1000)) {
+    Serial.printf("[OTA] FAIL: battery %d mV too low -> rollback\n", mv);
+    return false;                          // 电量不够撑过验证期，别冒险留在新版
+  }
+
+  Serial.println("[OTA] image verified, cancelling rollback.");
+  return true;
+}
+
 // ★ A5：电量到底线时的收尾动作。调用后不返回。
 void enterLowBatteryShutdown(int batteryMv) {
   Serial.printf("[BAT] %d mV below cutoff %.2f V — flushing and halting.\n",

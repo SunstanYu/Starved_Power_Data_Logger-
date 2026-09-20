@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPUpdateServer.h>
 #include "display_gateway.h"
 
 static const char* AP_SSID = "ESP32S3-Gateway";
@@ -11,6 +12,21 @@ static const IPAddress AP_GW(192, 168, 10, 1);
 static const IPAddress AP_MASK(255, 255, 255, 0);
 
 static WebServer server(80);
+
+// ★ A10：OTA。
+//
+// 【为什么现成方案都不适用】
+//   ArduinoOTA  —— 要设备和开发机在同一局域网，靠 mDNS 推送。田里没网。
+//   HTTPUpdate  —— 设备主动去服务器拉固件。同样要网。
+//
+// 【这个场景的天然解法】display 模式下设备【自己就是】AP + HTTP 服务器。
+// 走到田里 → 拨 GPIO5 → 设备重启进 display 模式 → 手机连它的 AP
+// → 打开 /update 上传 .bin → 设备重启跑新固件。全程不需要任何网络。
+//
+// ⚠️ 必须带认证：AP 在野外，不加认证等于谁都能刷你的固件。
+static HTTPUpdateServer updater;
+static const char* OTA_USER = "field";
+static const char* OTA_PASS = "starved-logger";
 
 static String getFieldValue(const String& record, const char* key) {
   String pattern = String(key) + "=";
@@ -151,6 +167,8 @@ static String buildPageTail() {
   return F("</ul><p class='muted'>Refresh the page to load the latest sample "
            "from storage.</p></section></section></main>"
            // 打开页面即对时：设备没有 RTC 也没有网络，浏览器是唯一时间源
+           "<p class='muted'>Firmware update: "
+           "<a href='/update'>/update</a></p>"
            "<script>"
            "fetch('/settime?epoch='+Math.floor(Date.now()/1000))"
            ".then(r=>r.text()).then(t=>console.log('clock sync:',t))"
@@ -223,6 +241,7 @@ void displayGatewaySetup() {
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/settime", HTTP_GET, handleSetTime);
+  updater.setup(&server, "/update", OTA_USER, OTA_PASS);   // ← 带认证的上传端点
   server.begin();
   Serial.println("[DISPLAY] HTTP server started.");
 }
