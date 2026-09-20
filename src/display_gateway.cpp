@@ -101,7 +101,7 @@ static String buildLatestPanels() {
   return html;
 }
 
-static String buildPage() {
+static String buildPageHead() {
   String html;
   html += "<!doctype html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
@@ -143,15 +143,32 @@ static String buildPage() {
   html += "</div></section>";
   html += "<section class='layout'>";
   html += buildLatestPanels();
-  html += "<section class='panel'><h2>History Log</h2>";
-  html += getDisplayStoredDataHtml();
-  html += "<p class='muted'>Refresh the page to load the latest sample from storage.</p>";
-  html += "</section></section></main></body></html>";
-  return html;
+  html += "<section class='panel'><h2>History Log</h2><ul>";
+  return html;                       // ← 到历史记录的 <ul> 为止，后面流式补
 }
 
+static String buildPageTail() {
+  return F("</ul><p class='muted'>Refresh the page to load the latest sample "
+           "from storage.</p></section></section></main></body></html>");
+}
+
+// ★ A1：分块发送，不再把整页拼成一个 String。
+//
+// 原来是 server.send(200, "text/html", buildPage())——buildPage 里把
+// 【整个日志文件】拼进一个 String。文件涨到几百 KB 就会耗尽堆，而且
+// String 分配失败是静默的：页面截断但不报错。
+//
+// 现在：Content-Length 未知 → 先发头 → 逐行发历史 → 发尾。
+// 峰值内存从 O(日志大小) 降到 O(单行)。
+static void emitChunk(const String& s) { server.sendContent(s); }
+
 static void handleRoot() {
-  server.send(200, "text/html", buildPage());
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  server.sendContent(buildPageHead());
+  streamDisplayStoredData(emitChunk);        // 每行发一次，发完即释放
+  server.sendContent(buildPageTail());
+  server.sendContent("");                    // 空块 = 结束
 }
 
 void displayGatewaySetup() {

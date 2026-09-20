@@ -370,6 +370,65 @@ void writeMeasurementRecord(const String& record) {
   }
 }
 
+// ★ A1：流式输出历史记录，替代把整个日志文件拼进一个 String。
+//
+// 【为什么必须改】
+// 每条记录约 150 字节，5 分钟一采 → 一天 43 KB、一周 300 KB。
+// 而 ESP32-S3 nopsram 可用堆只有 ~300 KB（WiFi 栈还要吃几十 KB）。
+// 更阴险的是 String::operator+= 内存不足时【静默失败】——返回被截断的
+// 字符串，页面显示不全但不报错；而且几百次「分配-拷贝-释放」会把堆打成碎片。
+//
+// 改法：调用方给一个 emit 回调，这里读一行发一行，内存占用从
+// O(文件大小) 降到 O(单行)。同时只回放最近 MAX_DISPLAY_ROWS 条——
+// 仪表盘上翻几千行没有意义，而且传输本身也耗电。
+static const size_t MAX_DISPLAY_ROWS = 60;
+
+void streamDisplayStoredData(void (*emit)(const String&)) {
+  if (!isStorageReady()) {
+    emit(String("<li>") + getStorageName() + " storage not ready.</li>");
+    return;
+  }
+
+  if (STORAGE_MODE != 0) {   // FFat 分支数据量小，沿用整段返回
+    String html = getDisplayStoredDataHtml();
+    emit(html);
+    return;
+  }
+
+  File file = SD.open(DISPLAY_DATA_FILE, FILE_READ);
+  if (!file) {
+    emit("<li>No SD data file.</li>");
+    return;
+  }
+
+  // 先数总行数，再跳到「倒数 MAX_DISPLAY_ROWS 行」开始发。
+  // 只做两遍顺序扫描，不把内容留在内存里。
+  size_t total = 0;
+  while (file.available()) {
+    if (file.readStringUntil('\n').length() > 0) total++;
+  }
+  size_t skip = total > MAX_DISPLAY_ROWS ? total - MAX_DISPLAY_ROWS : 0;
+
+  file.seek(0);
+  size_t idx = 0, sent = 0;
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (idx++ < skip) continue;
+    emit(String("<li>") + line + "</li>");     // ← 每行独立发，发完即释放
+    sent++;
+  }
+  file.close();
+
+  if (sent == 0) {
+    emit("<li>No records yet.</li>");
+  } else if (skip > 0) {
+    emit(String("<li class='muted'>… showing latest ") + sent +
+         " of " + total + " records</li>");
+  }
+}
+
 String getDisplayStoredDataHtml() {
   String html;
   html += "<ul>";
