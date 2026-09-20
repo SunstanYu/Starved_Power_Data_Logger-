@@ -66,27 +66,63 @@ extern const float BATTERY_CUTOFF_V = 3.7f;
 //   ① 合理性下限：4 节 AA 经 ÷3 分压，哪怕快没电也在 3V 以上。
 //      读到低于 1V 说明【没接电池 / ADC 悬空】，不是「电池空了」。
 //   ② 连续判定：单次 ADC 毛刺不该让一个田间节点停机。
-const int BATTERY_SANITY_FLOOR_MV = 1000;   // 低于此值 = 读数不可信，不是低电量
-const int BATTERY_LOW_STREAK = 3;           // 连续 3 次低于阈值才认
+// ★ 第二次修（第一次的判据是错的，上板又睡死一次才发现）
+//
+// 第一版下限设 1000mV，依据是「悬空 ADC 读数低」。**这个假设不成立** ——
+// 悬空引脚读的是随机的中间值，不是 0 附近。分压比 3:1，ADC 只要落在
+// 0.33~1.23V，换算出来就是 1.0~3.7V，正好落进低电量窗口，
+// 连续 3 次照样停机。加了连续判定只是把「1 秒睡死」变成「90 秒睡死」。
+//
+// 【按物理量重新定界】供电是 4 节 AA 碱性电池：
+//     满电 6.4V ·  标称 6.0V ·  0.9V/节 = 3.6V 已经耗尽
+// 所以 3.7V 截止是对的。但 3.0V（0.75V/节）是**深度放空**，
+// 一个还能跑 WiFi 的节点不可能读到这个值 —— 读到就说明【线路断了】，
+// 不是电池空了。下限提到 3000mV，可动作窗口变成 3.0~3.7V。
+//
+// 【再加一道：稳定性】电平本身区分不了悬空和真电压，但**噪声能**：
+// 接了电池经分压出来的读数是稳的，悬空引脚会飘。
+// 所以不只要连续 3 次低，还要这 3 次的极差小于 300mV。
+const int BATTERY_SANITY_FLOOR_MV = 3000;   // 0.75V/节 = 深度放空，读到只能是线路断了
+const int BATTERY_LOW_STREAK = 3;           // 连续 3 次
+const int BATTERY_STABLE_SPREAD_MV = 300;   // 这 3 次的极差上限——悬空会飘，电池不会
 
 // 返回 true 表示「确实该停机了」。
 bool batteryShouldShutdown(int batteryMv) {
   static int streak = 0;
+  static int lo = 0, hi = 0;
+
+#ifdef FORCE_DISPLAY_MODE
+  // 台面验证：板上没有电池、分压引脚悬空，低电量这条路径本身无意义。
+  // 只在测试构建里存在。
+  Serial.printf("[BAT] %d mV (bench build: low-battery shutdown disabled)\n", batteryMv);
+  return false;
+#endif
 
   if (batteryMv < BATTERY_SANITY_FLOOR_MV) {
-    if (streak) { streak = 0; }
-    Serial.printf("[BAT] %d mV below sanity floor -> treating as NO BATTERY, not low battery\n",
-                  batteryMv);
-    return false;                       // 悬空 / 没接电池，绝不停机
+    streak = 0;
+    Serial.printf("[BAT] %d mV below sanity floor %d -> NO BATTERY / wiring fault, "
+                  "not low battery\n", batteryMv, BATTERY_SANITY_FLOOR_MV);
+    return false;                       // 线路断了，绝不停机
   }
   if (batteryMv >= (int)(BATTERY_CUTOFF_V * 1000)) {
     streak = 0;
     return false;
   }
-  if (++streak < BATTERY_LOW_STREAK) {
+
+  if (streak == 0) { lo = hi = batteryMv; }
+  else { if (batteryMv < lo) lo = batteryMv; if (batteryMv > hi) hi = batteryMv; }
+  streak++;
+
+  if (streak < BATTERY_LOW_STREAK) {
     Serial.printf("[BAT] %d mV below cutoff (%d/%d) — waiting for confirmation\n",
                   batteryMv, streak, BATTERY_LOW_STREAK);
     return false;
+  }
+  if (hi - lo > BATTERY_STABLE_SPREAD_MV) {
+    Serial.printf("[BAT] readings unstable (spread %d mV > %d) -> floating pin, "
+                  "not a dying battery\n", hi - lo, BATTERY_STABLE_SPREAD_MV);
+    streak = 0;
+    return false;                       // 飘 = 悬空，不是电池在掉电
   }
   return true;
 }
