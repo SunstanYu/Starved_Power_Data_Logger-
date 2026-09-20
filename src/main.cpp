@@ -167,6 +167,12 @@ void setPeripheralSwitches(bool enabled) {
 // - LOW  => sensor logger mode
 // - HIGH => local display gateway mode
 bool isDisplayModeRequested() {
+#ifdef FORCE_DISPLAY_MODE
+  // 测试钩子：常驻模式要求 GPIO5 拉高，而那需要一根跳线。
+  // 开这个宏可以在没有跳线的台面上验证四任务架构本身。
+  // 只由 -DFORCE_DISPLAY_MODE 打开，正常构建里这段不存在。
+  return true;
+#endif
   return digitalRead((int)modePin) == HIGH;
 }
 
