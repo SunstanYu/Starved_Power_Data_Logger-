@@ -80,10 +80,22 @@ static const UBaseType_t RECORD_QUEUE_LEN = 4;
 // 所以定长字符数组。代价是 4×264 ≈ 1KB 静态占用，换来的是不会有悬空指针。
 struct RecordMsg { char line[264]; };
 
-// 栈深按【实测水位】留 2 倍余量，见 Supervisor 里的 uxTaskGetStackHighWaterMark 日志。
-static const uint32_t STACK_SENSOR  = 4096;
-static const uint32_t STACK_STORAGE = 6144;   // 文件系统调用吃栈
-static const uint32_t STACK_NET     = 8192;   // WebServer + String 渲染
+// 栈深。下面的数字来自 2026-09-20 的上板实测（supervisor 打的高水位），
+// 不是估的：
+//     sensor  4096 → 剩 1500   用掉 ~2.6K，余量仅 37%
+//     storage 6144 → 剩 4996   用掉 ~1.1K
+//     net     8192 → 剩 6892   用掉 ~1.3K
+//     superv  3072 → 剩 1224   用掉 ~1.8K
+//
+// ⚠️ 但 storage / net 那两个数【不能当结论】：测试板没插 SD 卡、
+// 也没发过 HTTP 请求，这两个任务最吃栈的路径（文件系统调用、
+// WebServer 渲染）根本没执行。等真有卡有请求时得重测。
+//
+// sensor 提到 5120：37% 的余量本来就偏紧，而且这次 AS7343 初始化失败、
+// 光谱读取那条路径也没走到，真实峰值只会更高。
+static const uint32_t STACK_SENSOR  = 5120;   // 实测用掉 2.6K，且峰值路径未覆盖
+static const uint32_t STACK_STORAGE = 6144;   // 文件系统调用吃栈（未实测到峰值）
+static const uint32_t STACK_NET     = 8192;   // WebServer + String 渲染（未实测到峰值）
 static const uint32_t STACK_SUPERV  = 3072;
 
 // ---------------------------------------------------------------- 共享状态
@@ -102,6 +114,26 @@ static TaskHandle_t g_hSensor = nullptr, g_hStorage = nullptr,
 // 各任务的心跳。监控任务靠它判断谁卡住了。
 // volatile + 32 位对齐写入在 Xtensa 上是原子的，所以这几个不用加锁。
 static volatile uint32_t g_beatSensor = 0, g_beatStorage = 0, g_beatNet = 0;
+
+// ★ 上板实测修（2026-09-20）
+//
+// 第一版每 5 秒比一次心跳，不动就报 stalled。但 sensor 的周期是 30 秒——
+// 6 次检查里有 5 次它【本来就不该动】，于是每轮都喊 stalled，
+// 而那一整段时间它在正常采样。
+//
+// 这个 bug 比它看起来严重：**一个天天喊狼来了的监控，
+// 真出事时没人会信。** 它比没有监控更糟，因为它制造了「已经在看着」的错觉。
+//
+// 改法：容忍时间不能一刀切，得按各任务【自己的节奏】给。
+// 取各自周期的 2 倍再加一点余量 —— 漏掉一个周期算抖动，
+// 连着漏两个才是真卡住。
+struct BeatWatch {
+  volatile uint32_t* beat;
+  const char*        name;
+  uint32_t           tolerance_ms;   // 超过这么久没动才算卡住
+  uint32_t           last;
+  uint32_t           last_change_ms;
+};
 
 static void publishLatest(const String& rec) {
   // ★ 这里必须加锁：String 的赋值不是原子的（要改指针、长度、可能重新分配堆）。
@@ -213,23 +245,35 @@ static void netTask(void*) {
 
 static void supervisorTask(void*) {
   esp_task_wdt_add(nullptr);
-  uint32_t pS = 0, pT = 0, pN = 0;
-  bool first = true;
+
+  uint32_t now0 = millis();
+  BeatWatch watch[] = {
+    // sensor 每 SENSOR_PERIOD_MS 动一次，容忍两个周期 + 10s 采样耗时
+    {&g_beatSensor,  "sensor",  SENSOR_PERIOD_MS * 2 + 10000, 0, now0},
+    // storage 阻塞等队列，超时 2s，所以至少 2s 一动
+    {&g_beatStorage, "storage", 10000, 0, now0},
+    // net 每次 displayGatewayLoop() 后就动，很快
+    {&g_beatNet,     "net",     5000,  0, now0},
+  };
 
   for (;;) {
     esp_task_wdt_reset();
     vTaskDelay(pdMS_TO_TICKS(SUPERVISOR_PERIOD_MS));
+    uint32_t now = millis();
 
     // 心跳不动 = 那个任务卡在某个调用里出不来。
     // Task WDT 最终也会抓到，但它抓到时是 panic 复位；
     // 这里先把【是谁】打出来，coredump 之外多一条线索。
-    if (!first) {
-      if (g_beatSensor == pS)  Serial.println("[SUPERV] ⚠ sensor task stalled");
-      if (g_beatStorage == pT) Serial.println("[SUPERV] ⚠ storage task stalled");
-      if (g_beatNet == pN)     Serial.println("[SUPERV] ⚠ net task stalled");
+    for (auto& w : watch) {
+      uint32_t v = *w.beat;
+      if (v != w.last) { w.last = v; w.last_change_ms = now; continue; }
+      uint32_t silent = now - w.last_change_ms;
+      if (silent > w.tolerance_ms) {
+        Serial.printf("[SUPERV] ⚠ %s task stalled (%lus silent, tolerance %lus)\n",
+                      w.name, (unsigned long)(silent / 1000),
+                      (unsigned long)(w.tolerance_ms / 1000));
+      }
     }
-    first = false;
-    pS = g_beatSensor; pT = g_beatStorage; pN = g_beatNet;
 
     // A6 的水位日志，按任务分别报 —— 单看全局堆看不出是谁的栈快满了。
     Serial.printf("[SUPERV] stack_free sensor=%u storage=%u net=%u superv=%u  heap=%u min=%u\n",
