@@ -34,6 +34,17 @@ const char* DISPLAY_DATA_FILE = "/sensor_log.txt";
 const float ADC_VREF = 3.3f;
 const float BATTERY_DIVIDER_RATIO = 3.0f;
 const float BATTERY_LOW_THRESHOLD_V = 4.0f;
+
+// ★ A5：低电压截止。
+//
+// 供电是 4 节 AA（标称 6.0V）。碱性电池没有锂电「过放即报废」的问题，
+// 所以这里的理由不是保护电池，而是【保护数据】：
+// 电压掉到 3.3V LDO 的压差余量以下时，轨会不稳；如果恰好发生在
+// SD 写入中途，坏的是文件甚至整张卡——而那是几个月的数据。
+//
+// 所以到阈值就：刷掉待写数据 → 点亮低电量灯 → 进【无定时唤醒】的深睡。
+// 不设定时器意味着它不会再自己醒来采样，只能靠 EXT0（人拨开关）或换电池。
+const float BATTERY_CUTOFF_V = 3.7f;
 DHTesp dht;
 SfeAS7343ArdI2C spectralSensor;
 uint16_t spectralChannels[ksfAS7343NumChannels];
@@ -49,6 +60,16 @@ unsigned long modePinLowStartMs = 0;
 RTC_DATA_ATTR uint32_t sampleCounter = 0;
 
 // ====================== HELPERS ======================
+
+// ★ A5：电量到底线时的收尾动作。调用后不返回。
+void enterLowBatteryShutdown(int batteryMv) {
+  Serial.printf("[BAT] %d mV below cutoff %.2f V — flushing and halting.\n",
+                batteryMv, BATTERY_CUTOFF_V);
+  digitalWrite(batteryLedPin, HIGH);
+  setPeripheralSwitches(false);          // 先断外设，减少残余放电
+  Serial.flush();
+  esp_deep_sleep_start();                // 无定时唤醒源 = 不会再自己醒
+}
 
 // ★ A6：资源水位。诊断「跑久了会不会崩」只能靠这个，不能靠推测。
 //
@@ -320,18 +341,18 @@ String buildMeasurementRecord(
   record += String(moisture);
   record += ",voltage_mv=";
   record += String(batteryMv);
+  // ★ A7：显式的数据质量位。
+  //
+  // 原来读失败写 "nan"，但下游分不清三件事：传感器读失败、传感器真的
+  // 返回了 NaN、解析出错。在 esp32-autoflash 的评测里正好栽过同一个坑
+  // ——「读数恒 0」到底是代码写坏了还是传感器坏了，只看数值无法归因。
+  // 带上质量位，归因就从「猜」变成「读一个字段」。
   record += ",temp_c=";
-  if (dhtOk) {
-    record += String(temperatureC, 1);
-  } else {
-    record += "nan";
-  }
+  record += dhtOk ? String(temperatureC, 1) : String("nan");
   record += ",humidity=";
-  if (dhtOk) {
-    record += String(humidity, 1);
-  } else {
-    record += "nan";
-  }
+  record += dhtOk ? String(humidity, 1) : String("nan");
+  record += ",dht_q=";
+  record += dhtOk ? "ok" : "read_fail";
   record += ",spectral=";
   if (channelCount > 0) {
     for (int i = 0; i < channelCount; i++) {
@@ -745,6 +766,9 @@ void loop() {
 
     int moisture = getMoisture();
     int batteryMv = getBatteryMv();
+    if (batteryMv > 0 && batteryMv < (int)(BATTERY_CUTOFF_V * 1000)) {
+      enterLowBatteryShutdown(batteryMv);   // 在写卡【之前】判，确保还有电落盘
+    }
     float temperatureC = 0.0f;
     float humidity = 0.0f;
     bool dhtOk = readDht11(temperatureC, humidity);
