@@ -49,6 +49,47 @@ unsigned long modePinLowStartMs = 0;
 RTC_DATA_ATTR uint32_t sampleCounter = 0;
 
 // ====================== HELPERS ======================
+
+// ★ A6：资源水位。诊断「跑久了会不会崩」只能靠这个，不能靠推测。
+//
+// getMinFreeHeap() 是【历史最低值】——它回答的是「最危险的那一刻离
+// OOM 还有多远」，比当前空闲值有用得多。栈水位同理：uxTaskGetStack-
+// HighWaterMark 返回的是该任务栈的历史最小剩余字节。
+void logResourceWatermark(const char* tag) {
+  Serial.printf("[MEM] %s heap=%u min=%u largest=%u stack_free=%u\n",
+                tag,
+                ESP.getFreeHeap(),
+                ESP.getMinFreeHeap(),                        // 历史最低 ← 关键
+                ESP.getMaxAllocHeap(),                       // 最大连续块 ← 看碎片
+                uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
+}
+
+// ★ A4：Task WDT。田里的节点卡死 = 报废，只能人去拔电池。
+//
+// Arduino 默认【关掉】了 task WDT（原型阶段谁也不想跑着跑着被复位），
+// 但生产设备必须有人盯着「卡死」这件事：SD 总线卡住、传感器不应答、
+// 某个 while 等不到条件——这些都不会自己恢复。
+//
+// 采样态与显示态的超时不同：采样一轮含 2.5s 的外设稳定与 DHT11 时序，
+// 显示态则是持续响应 HTTP。所以由调用方给超时值。
+#include "esp_task_wdt.h"
+
+void watchdogBegin(uint32_t timeout_s) {
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t cfg = {
+      .timeout_ms = timeout_s * 1000,
+      .idle_core_mask = 0,          // 不监控 idle 任务
+      .trigger_panic = true,        // 超时直接 panic 复位（现场会进 coredump）
+  };
+  esp_task_wdt_reconfigure(&cfg);
+#else
+  esp_task_wdt_init(timeout_s, true);
+#endif
+  esp_task_wdt_add(NULL);           // 把当前任务纳入监控
+  Serial.printf("[WDT] armed, timeout=%us\n", timeout_s);
+}
+
+void watchdogFeed() { esp_task_wdt_reset(); }
 void setPeripheralSwitches(bool enabled) {
   digitalWrite(switch1Pin, enabled ? HIGH : LOW);
   digitalWrite(switch2Pin, enabled ? HIGH : LOW);
@@ -611,6 +652,8 @@ void setup() {
     Serial.println("[MODE] GPIO5 HIGH -> display mode.");
     initializeDisplayStorage();
     displayGatewaySetup();
+    logResourceWatermark("display-boot");
+    watchdogBegin(30);              // 常驻态：30s 没喂狗说明卡在某个请求里
     return;
   }
 
@@ -622,6 +665,9 @@ void setup() {
   // D6 used as wake/mode switch input
   // If external pull-up/pull-down is provided, INPUT may be used here
   // pinMode(wakePin, PULLDOWN);  // assuming you detect HIGH as trigger
+
+  logResourceWatermark("logger-boot");
+  watchdogBegin(60);                // 采样态：一轮含 2.5s 外设等待，留足余量
 
   Serial.println("\n================================");
   Serial.println("[INFO] Data logger mode enabled.");
@@ -637,6 +683,7 @@ void loop() {
         Serial.println("[MODE] GPIO5 returned HIGH. Cancel logger switch countdown.");
         modePinLowTiming = false;
       }
+      watchdogFeed();
       displayGatewayLoop();
       return;
     }
@@ -660,6 +707,7 @@ void loop() {
   //     forever_awake = true;
   //   }
   // }
+  watchdogFeed();
   static unsigned long start_time = millis();
   unsigned long current_time = millis();
   unsigned long elapsed_time = current_time - start_time;
@@ -723,6 +771,8 @@ void loop() {
     } else {
       Serial.println("[SAMPLE] Measurement sampled but not recorded this cycle.");
     }
+
+    logResourceWatermark("post-sample");   // 每轮落一条，跑几天就能看出趋势
 
     Serial.println("\n================================");
     Serial.println("Logger cycle complete. Entering timed deep sleep...");
