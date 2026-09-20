@@ -9,6 +9,7 @@
 #include <SparkFun_AS7343.h>
 #include <time.h>
 #include "display_gateway.h"
+#include "tasks.h"
 
 // ====================== CONSTANTS & PINS ======================
 const uint64_t SLEEP_DURATION_US = 10 * 1000000;   // sleep for 10 seconds
@@ -44,7 +45,9 @@ const float BATTERY_LOW_THRESHOLD_V = 4.0f;
 //
 // 所以到阈值就：刷掉待写数据 → 点亮低电量灯 → 进【无定时唤醒】的深睡。
 // 不设定时器意味着它不会再自己醒来采样，只能靠 EXT0（人拨开关）或换电池。
-const float BATTERY_CUTOFF_V = 3.7f;
+// extern：C++ 里命名空间作用域的 const 默认是【内部链接】，
+// 不加 extern 的话 tasks.cpp 链接时找不到它。
+extern const float BATTERY_CUTOFF_V = 3.7f;
 DHTesp dht;
 SfeAS7343ArdI2C spectralSensor;
 uint16_t spectralChannels[ksfAS7343NumChannels];
@@ -55,6 +58,7 @@ bool sdReady = false;
 bool flashReady = false;
 bool spectralReady = false;
 bool displayModeActive = false;
+bool tasksRunning = false;      // ★ A8：四任务是否起来了
 bool modePinLowTiming = false;
 unsigned long modePinLowStartMs = 0;
 RTC_DATA_ATTR uint32_t sampleCounter = 0;
@@ -602,6 +606,15 @@ String getDisplayStoredDataHtml() {
 }
 
 String getDisplayLatestRecord() {
+  // ★ A8 的用户可见收益：优先返回【内存里】刚采到的那条。
+  // 改造前这里只能去存储里读上一条已落盘的记录 ——
+  // 而常驻模式下根本不采样，所以网页上的"实时数据"其实是上次 logger
+  // 模式留下的旧数据。现在采样任务一采完就 publish，不用等写卡。
+  String live;
+  if (tasksGetLatest(live)) {
+    return live;
+  }
+
   if (!isStorageReady()) {
     return "";
   }
@@ -715,6 +728,13 @@ void setup() {
     displayGatewaySetup();
     logResourceWatermark("display-boot");
     watchdogBegin(30);              // 常驻态：30s 没喂狗说明卡在某个请求里
+
+    // ★ A8：常驻模式才起四任务。起不来就退回原来的单线程 loop()，
+    // 功能照旧，只是又变回"要么采样要么服务网页"。
+    setPeripheralSwitches(true);
+    initializeLoggerPeripherals();   // 采样任务要用的外设，先初始化好
+    setPeripheralSwitches(false);
+    tasksRunning = tasksBegin();
     return;
   }
 
@@ -745,7 +765,8 @@ void loop() {
         modePinLowTiming = false;
       }
       watchdogFeed();
-      displayGatewayLoop();
+      // ★ A8：任务起来后，HTTP 由 net 任务处理，loop() 不再自己跑
+      if (tasksRunning) { tasksIdle(); } else { displayGatewayLoop(); }
       return;
     }
 
@@ -757,7 +778,7 @@ void loop() {
       restartForModeSwitch("[MODE] GPIO5 stayed LOW long enough. Restarting into logger mode.");
     }
 
-    displayGatewayLoop();
+    if (tasksRunning) { tasksIdle(); } else { displayGatewayLoop(); }
     return;
   }
 
