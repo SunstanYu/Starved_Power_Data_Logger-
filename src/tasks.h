@@ -19,3 +19,11 @@ bool tasksGetLatest(String& out);
 
 // 常驻模式的 loop() 在任务起来后没事干，交出 CPU 即可。
 void tasksIdle();
+
+// ★ 存储锁。SD / FFat 的底层是 SPI + FATFS，【不是线程安全的】，
+// 而 net 任务要读文件渲染页面、storage 任务要写文件落盘 —— 会撞。
+//
+// 四任务没起来时（logger 模式、或任务创建失败退回单线程），
+// 这两个函数是空操作，所以调用点不需要分情况写。
+bool storageLock(uint32_t timeout_ms);
+void storageUnlock();

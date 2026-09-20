@@ -89,6 +89,9 @@ static const uint32_t STACK_SUPERV  = 3072;
 
 static QueueHandle_t      g_recordQ    = nullptr;
 static SemaphoreHandle_t  g_latestMux  = nullptr;
+// 递归锁：写入路径里可能嵌套调用其它也要锁的函数，
+// 普通互斥量在这种情况下会把自己锁死。
+static SemaphoreHandle_t  g_storageMux = nullptr;
 static String             g_latest;            // ← 被 mux 保护
 static volatile bool      g_latestValid = false;
 
@@ -107,6 +110,15 @@ static void publishLatest(const String& rec) {
     g_latestValid = true;
     xSemaphoreGive(g_latestMux);
   }
+}
+
+bool storageLock(uint32_t timeout_ms) {
+  if (!g_storageMux) return true;          // 单线程路径，无需加锁
+  return xSemaphoreTakeRecursive(g_storageMux, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+void storageUnlock() {
+  if (g_storageMux) xSemaphoreGiveRecursive(g_storageMux);
 }
 
 bool tasksGetLatest(String& out) {
@@ -154,6 +166,11 @@ static void sensorTask(void*) {
     }
 
     if (batteryMv > 0 && batteryMv < (int)(BATTERY_CUTOFF_V * 1000)) {
+      // ★ 先拿存储锁再停机。storage 任务可能正写到一半 ——
+      // 直接 esp_deep_sleep_start() 会在写入中途掐断电，
+      // 损坏的恰恰是 A5 本来要保护的那份数据。
+      // 拿到锁 = 没有写入在进行中。拿不到也得走，但至少等满 5s。
+      storageLock(5000);
       enterLowBatteryShutdown(batteryMv);    // 不返回
     }
 
@@ -232,12 +249,14 @@ static void teardown() {
   if (g_hSuperv)  { vTaskDelete(g_hSuperv);  g_hSuperv = nullptr; }
   if (g_recordQ)  { vQueueDelete(g_recordQ); g_recordQ = nullptr; }
   if (g_latestMux){ vSemaphoreDelete(g_latestMux); g_latestMux = nullptr; }
+  if (g_storageMux){ vSemaphoreDelete(g_storageMux); g_storageMux = nullptr; }
 }
 
 bool tasksBegin() {
   g_recordQ = xQueueCreate(RECORD_QUEUE_LEN, sizeof(RecordMsg));
   g_latestMux = xSemaphoreCreateMutex();
-  if (!g_recordQ || !g_latestMux) {
+  g_storageMux = xSemaphoreCreateRecursiveMutex();
+  if (!g_recordQ || !g_latestMux || !g_storageMux) {
     Serial.println("[TASK] queue/mutex alloc failed");
     teardown();
     return false;

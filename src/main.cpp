@@ -474,7 +474,20 @@ void writeMeasurementToFlash(const String& record) {
   Serial.printf("[FFat] Measurement written: %s\n", path.c_str());
 }
 
+// ★ A8：存储访问的 RAII 锁。
+//
+// 下面几个函数都有多个提前返回路径，手工配对 storageLock/storageUnlock
+// 迟早会漏掉一条 —— 漏一次就是永久死锁。让析构函数去做。
+//
+// 四任务没起来时 storageLock() 是空操作，所以 logger 模式不受影响。
+struct StorageGuard {
+  bool held;
+  explicit StorageGuard(uint32_t ms = 4000) : held(storageLock(ms)) {}
+  ~StorageGuard() { if (held) storageUnlock(); }
+};
+
 void writeMeasurementRecord(const String& record) {
+  StorageGuard g;                       // ← net 任务可能正在读同一张卡
   if (STORAGE_MODE == 0) {
     appendMeasurementToSd(record);
   } else {
@@ -496,6 +509,10 @@ void writeMeasurementRecord(const String& record) {
 static const size_t MAX_DISPLAY_ROWS = 60;
 
 void streamDisplayStoredData(void (*emit)(const String&)) {
+  // 整段发送期间都持锁。发一个页面可能要几秒（分块走 WiFi），
+  // 这段时间 storage 任务写不进去 —— 但队列能缓 4 条 × 30s = 2 分钟，
+  // 缓冲足够，而正确性不能让。
+  StorageGuard g;
   if (!isStorageReady()) {
     emit(String("<li>") + getStorageName() + " storage not ready.</li>");
     return;
@@ -542,6 +559,7 @@ void streamDisplayStoredData(void (*emit)(const String&)) {
 }
 
 String getDisplayStoredDataHtml() {
+  StorageGuard g;                       // 递归锁，被上面那个函数嵌套调用也安全
   String html;
   html += "<ul>";
 
@@ -621,6 +639,7 @@ String getDisplayLatestRecord() {
     return live;
   }
 
+  StorageGuard g;
   if (!isStorageReady()) {
     return "";
   }
