@@ -91,10 +91,17 @@ bool batteryShouldShutdown(int batteryMv) {
   static int streak = 0;
   static int lo = 0, hi = 0;
 
-#ifdef FORCE_DISPLAY_MODE
-  // 台面验证：板上没有电池、分压引脚悬空，低电量这条路径本身无意义。
-  // 只在测试构建里存在。
-  Serial.printf("[BAT] %d mV (bench build: low-battery shutdown disabled)\n", batteryMv);
+#ifdef BENCH_NO_BATTERY
+  // ★ 独立开关，不再跟 FORCE_DISPLAY_MODE 绑在一起。
+  //
+  // 这两个是【两件事】：FORCE_DISPLAY_MODE 是「没接跳线」，
+  // BENCH_NO_BATTERY 是「没接电池」。第一版把旁路写在
+  // #ifdef FORCE_DISPLAY_MODE 里，结果台面验证时这个函数【一进来就返回】，
+  // 下面那两道判据（合理性下限、稳定性）一次都没在真硬件上跑过 ——
+  // 而它们恰恰是那个把板子睡死两次的 bug 的修复本身。
+  //
+  // 耦合两个无关的开关，等于让其中一个永远测不到。
+  Serial.printf("[BAT] %d mV (bench: low-battery shutdown disabled)\n", batteryMv);
   return false;
 #endif
 
