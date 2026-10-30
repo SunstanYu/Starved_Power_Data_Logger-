@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "esp_sleep.h"
 #include "driver/gpio.h"  // for access to gpio_num_t / GPIO_NUM_6
+#include "driver/rtc_io.h" // 深睡期间保持 modePin 下拉，见 configureWakeSources()
 #include <SPI.h>
 #include <SD.h>
 #include <FFat.h>
@@ -36,7 +37,14 @@ const int ssr3v3SensorPin  = 33;   // U6 -> /3.3v Sensor   -> J6 四脚 3.3V I2C
 const int ssr3v3Sensor1Pin = 47;   // U5 -> /3.3v Sensor_1 -> J5 三脚 3.3V 单总线（DHT11）
 const int ssr6vSensorPin   = 26;   // U4 -> /6v Sensor     -> J7 三脚 6V
 const int ssr6vSensor1Pin  = 18;   // U7 -> /6v Sensor_1   -> J4 四脚 5V I2C
-const uint32_t SENSOR_RAIL_SETTLE_MS = 500;   // 合闸后等轨电压建立 + 传感器上电复位
+// ★ 2026-10-30：500 → 1500。DHT11 上电后要 1~2s 才响应，500ms 不够。
+// 【依据】台面探针从 SSR 合闸到开读间隔约 6.7s，读得出 24.5C/30%RH；
+// 项目原来只隔约 0.6s（[RAIL] ON 到 [DHT11] Reading... 的实测时间差），读不出。
+// 注意瓶颈在「上电到首读」，不在「两次读之间」—— 在后者加重试和延时实测完全无效。
+// 另注：DHTesp::getTempAndHumidity() 里那句 "Try a second time to read" 是【死代码】——
+// 它在超时后立刻再调 readSensor()，而那个函数开头有 999ms 的 1Hz 节流闸，
+// 第二次必定原地返回，一次都没真试过。所以别指望库自己的重试。
+const uint32_t SENSOR_RAIL_SETTLE_MS = 1500;  // 合闸后等轨电压建立 + 传感器上电复位
 
 void enableSensorRails(bool on) {
   const int pins[] = {ssr3v3SensorPin, ssr3v3Sensor1Pin,
@@ -372,6 +380,19 @@ void printWakeupReason() {
 void configureWakeSources() {
   esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
   esp_sleep_enable_ext0_wakeup(modePin, 1);
+
+  // ★ 2026-10-30：深睡期间把 modePin 焊盘下拉住。
+  //
+  // 【实测现象】串口里出现 "[WAKE] Wakeup caused by EXT0 (GPIO12 HIGH)"，
+  // 而当时【没有任何人碰那个脚】—— modePin 换到 GPIO12(J8 脚1) 后物理悬空，
+  // 浮空噪声把 EXT0 触发了，本该睡 10 秒的节点被随机叫醒。
+  // 对低功耗节点这是实打实的电量损失。
+  //
+  // setup() 里那句 pinMode(INPUT_PULLDOWN) 只管普通 GPIO 外设，
+  // 一进深睡数字外设就掉电，拉电阻跟着失效。要让它在睡眠中继续有效，
+  // 必须配 RTC 焊盘 —— 这也是 modePin 当初必须选 RTC GPIO(0~21) 的原因之一。
+  rtc_gpio_pulldown_en(modePin);
+  rtc_gpio_pullup_dis(modePin);
 }
 
 // A reboot is the cleanest way to switch modes at runtime because setup()
@@ -482,16 +503,23 @@ bool readDht11(float& temperatureC, float& humidity) {
   humidity = data.humidity;
   temperatureC = data.temperature;
 
-  // ★ 2026-10-30：判据补一条「全 0 也算失败」。
-  // 原来只判 isnan，而 DHT11 读不到时返回的是 0.0/0.0 —— 【0.0 不是 NaN】，
-  // 原判据直接放它过去，一条 t=0.0 h=0.0 的垃圾读数会被当成有效测量写进记录。
-  // 和本仓库 A5 那条「batteryMv > 0 挡不住悬空 ADC」是同一个形状：
-  // 判据写的是「不是非法值」，想表达的是「读数有效」。
+  // ★ 2026-10-30：判据补一条「湿度为 0 也算失败」。
   //
-  // 不加重试、不加延时：实测加了 2.4s 的重试与重新 setup 完全无效，
-  // 说明当前读不到的原因不在时序。原有节奏保持不变。
-  if (isnan(humidity) || isnan(temperatureC)
-      || (humidity == 0.0f && temperatureC == 0.0f)) {
+  // 【为什么不能只判 isnan】归因固件实测，传感器那一路断电再上电之后：
+  //     i=1  err=TIMEOUT  t=nan  h=nan      ← isnan 挡得住
+  //     i=2  err=OK       t=0.8  h=0.0      ← ★ 库说成功，数据是垃圾
+  //     i=3  err=OK       t=26.8 h=22.0     ← 第三次才真有效
+  // 第二次那种「成功的垃圾」里 getStatus() 返回 ERROR_NONE、isnan() 也过得去。
+  // 而项目每轮采样之间都会断电（深睡前 setPeripheralSwitches(false)），
+  // 所以每次醒来都会撞上它。
+  //
+  // 【为什么只判湿度】第一版写的是 h==0 && t==0 —— 要两个都为零，
+  // 而实测的垃圾是 t=0.60 h=0.00，温度不为零，&& 不成立就放行了。
+  // DHT11 的湿度量程是 20~90%RH，h=0 本身就超规格，只判湿度足够且更严。
+  //
+  // 不加重试、不加延时：实测加 2.4s 的重试与重新 setup 完全无效。
+  // （当时读不出的真实原因是一根线松了，不是时序。）
+  if (isnan(humidity) || isnan(temperatureC) || humidity <= 0.0f) {
     Serial.println("[DHT11] Failed to read from DHT11");
     return false;
   }
