@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "esp_sleep.h"
+#include "esp_system.h"  // esp_reset_reason()，区分真正上电与深睡唤醒
 #include "driver/gpio.h"  // for access to gpio_num_t / GPIO_NUM_6
 #include "driver/rtc_io.h" // 深睡期间保持 modePin 下拉，见 configureWakeSources()
 #include <SPI.h>
@@ -16,7 +17,20 @@
 const uint64_t SLEEP_DURATION_US = 10 * 1000000;   // sleep for 10 seconds
 const uint32_t AWAKE_DURATION_MS = 20 * 1000;      // awake for 20 seconds
 const uint32_t MODE_SWITCH_DELAY_MS = 5000;         // modePin(GPIO12) must stay LOW for 5s before leaving display mode
-const uint32_t RECORD_EVERY_SAMPLE_COUNT = 50;      // write one record every 50 samples
+// ★ 2026-10-30：改成「每小时一条」。
+//
+// 【为什么从周期推导而不是写死】原来写死 50，含义依赖于当时的醒/睡时长
+// （一轮一个样本，30s 一轮 → 25 分钟一条）。改了上面任何一个时长，
+// 这个数就悄悄变成别的意思，而注释不会跟着变。
+// 推导出来则「一小时一条」这个【意图】被编码进代码，改时长也不会漂。
+//
+// 当前值：(20000 + 10000) ms 一轮 → 3600000 / 30000 = 120 个样本 = 1 小时。
+// 注意这是按唤醒次数算的近似值：深睡定时器有漂移，不等于墙上时钟的整点。
+// 记录里的 clk= 字段标明时间来源是否可信，下游据此判断。
+const uint32_t LOGGER_CYCLE_MS = AWAKE_DURATION_MS + (uint32_t)(SLEEP_DURATION_US / 1000ULL);
+const uint32_t RECORD_INTERVAL_MS = 60UL * 60UL * 1000UL;   // 一小时
+static_assert(LOGGER_CYCLE_MS > 0, "醒+睡时长不能都是 0，否则下面要除零");
+const uint32_t RECORD_EVERY_SAMPLE_COUNT = RECORD_INTERVAL_MS / LOGGER_CYCLE_MS;
 const int STORAGE_MODE = 0;                         // 0 = SD card, 1 = FFat flash
 int led = LED_BUILTIN;
 // ★ 2026-10-30：从 GPIO5 换到 GPIO12。
@@ -1002,7 +1016,11 @@ void initializeLoggerPeripherals() {
   // 卡上是 append 的历史数据，光看记录分不出「这一行是这次启动写的」还是
   // 「上次运行留下的」。排查 AS7343 时正是「线接回去但没复位、读的还是旧状态」
   // 这个形状耗掉了很多时间 —— 标记行让每次上电在数据里留下明确的分界。
-  if (isStorageReady()) {
+  //
+  // 【只在真正上电时写】logger 模式每次深睡唤醒都会重跑 setup()，
+  // 不加这道判断就是 30 秒一行、一天 2880 行 —— 而记录本身才一小时一条，
+  // 标记行反而成了卡上的主要内容，和「少写卡」的意图正好相反。
+  if (esp_reset_reason() != ESP_RST_DEEPSLEEP && isStorageReady()) {
     writeMeasurementRecord("2026/10/30 test：");
     Serial.println("[SD] boot marker written.");
   }
