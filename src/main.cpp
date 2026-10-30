@@ -28,7 +28,30 @@ const int batteryLedPin = T13;
 
 const int sensor1Pin = A3;   // DHT11 data pin, use the real GPIO number 
 const int sensor2Pin = A4;    // soil moisture sensor analog input
-const int SDcardPin = T12;
+// ★ 2026-10-30：SD 卡四根线按 StarvedLogger_PCB.kicad_pcb 的网表改正。
+//
+// 【改之前是错的，而且错了三条】原来是 `SDcardPin = T12`（GPIO12）加裸
+// `SPI.begin()`，后者走 Feather variant 的默认值 MOSI=35 SCK=36 MISO=37。
+// 对照 J3 实际接线：
+//       CS   旧 GPIO12 / 实际 GPIO35   ✗
+//       MOSI 旧 GPIO35 / 实际 GPIO36   ✗（旧的 MOSI 正好是实际的 CS）
+//       SCK  旧 GPIO36 / 实际 GPIO38   ✗（旧的 SCK 正好是实际的 MOSI）
+//       MISO 旧 GPIO37 / 实际 GPIO37   ✓ 只有这条碰巧撞对
+// 往 CS 线上发时钟、拿 MOSI 当片选，SD.begin() 不可能成功。
+//
+// 【来源】J3(Conn_01x08) 脚2/3/4/5 = /CS /DI /DO /CLK，
+// 分别连 U1 封装脚 31/32/33/34 = IO35/IO36/IO37/IO38。
+// 注意封装脚号不是 GPIO 号。详见 hardware/PINOUT.md。
+//
+// 【已上板实测】显式 SPI.begin(38,37,36,35) + SD.begin(35,...) 后，
+// 写入→读回→逐字节比对连续 14 轮全部 match，文件字节数单调递增。
+//
+// GPIO35/36/37 在【八线 PSRAM】的 S3 模组上是给 PSRAM 用的、不可做 GPIO。
+// 本板是 ESP32-S3-MINI-1（无 PSRAM）所以没问题；换成 R8 之类型号这条总线会整个废掉。
+const int SDcardPin = 35;    // /CS  → U1 封装脚 31
+const int SD_MOSI   = 36;    // /DI  → U1 封装脚 32（主→卡）
+const int SD_MISO   = 37;    // /DO  → U1 封装脚 33（卡→主）
+const int SD_SCK    = 38;    // /CLK → U1 封装脚 34
 const int batteryAdcPin = A2;
 const char* DISPLAY_SENSOR_TYPE = "Soil moisture + DHT11 + AS7343";
 const char* DISPLAY_DATA_FILE = "/sensor_log.txt";
@@ -168,6 +191,9 @@ RTC_DATA_ATTR uint32_t sampleCounter = 0;
 extern "C" bool verifyOta() {
   Serial.println("[OTA] verifying new image...");
 
+  // ★ 这里原本直接 SD.begin 而没有 SPI.begin —— 本函数在启动早期跑，
+  // 可能先于 initSdCard()，那时 SPI 还没按本板引脚配过。
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SDcardPin);
   pinMode(SDcardPin, OUTPUT);
   digitalWrite(SDcardPin, HIGH);
   if (!SD.begin(SDcardPin, SPI, 1000000)) {
@@ -411,8 +437,9 @@ int readSpectralChannels(uint16_t* channels, size_t channelCapacity) {
 }
 
 bool initSdCard() {
-  Serial.printf("[SD] Initializing with CS pin %d...\n", SDcardPin);
-  SPI.begin();
+  Serial.printf("[SD] Initializing with CS=%d SCK=%d MISO=%d MOSI=%d...\n",
+                SDcardPin, SD_SCK, SD_MISO, SD_MOSI);
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SDcardPin);   // 必须显式指定：默认值是 Feather 的，和本板不符
   pinMode(SDcardPin, OUTPUT);
   digitalWrite(SDcardPin, HIGH);
   if (!SD.begin(SDcardPin, SPI, 1000000)) {
