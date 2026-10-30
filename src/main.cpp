@@ -50,9 +50,13 @@ void enableSensorRails(bool on) {
                 ssr6vSensorPin, ssr6vSensor1Pin);
 }
 
-const int switch1Pin = T10;
-const int switch2Pin = T6;
-const int switch3Pin = T9;
+// ⚠️ 本板上这三个脚不是电源开关，【不要再用】。保留仅为标注冲突：
+//   T10 = GPIO10 -> /I2C_SDA 5v      T6 = GPIO6 -> 未连接
+//   T9  = GPIO9  -> /I2C_SCL 3.3V
+// 外设供电请用 enableSensorRails()。
+const int switch1Pin = T10;    // = GPIO10，实为 I2C SDA 5V —— 勿驱动
+const int switch2Pin = T6;     // = GPIO6，本板未连接
+const int switch3Pin = T9;     // = GPIO9，实为 I2C SCL 3.3V —— 勿驱动
 const int batteryLedPin = T13;
 
 
@@ -320,24 +324,26 @@ void watchdogBegin(uint32_t timeout_s) {
 }
 
 void watchdogFeed() { esp_task_wdt_reset(); }
+// ★ 2026-10-30 重写。原来这里对 switch1/2/3Pin 做 digitalWrite，而在本板上：
+//     switch1Pin = T10 = GPIO10 -> /I2C_SDA 5v
+//     switch2Pin = T6  = GPIO6  -> 网表里根本没有 IO6（未连接）
+//     switch3Pin = T9  = GPIO9  -> /I2C_SCL 3.3V      ★
+// 等于把两条 I2C 线当推挽输出在驱动。三个脚在本板上【没有一个是电源开关】——
+// 真正的外设供电是四路 ASSR-1218 固态继电器（见 enableSensorRails）。
+//
+// 【为什么以前没炸】logger 模式每次深睡醒来 setup() 重跑、Wire.begin() 把引脚
+// 抢回去，所以侥幸能用。但四任务模式里每轮采样结束会调 (false)，
+// 把 SCL 钳在 LOW 且之后没有 Wire.begin —— I2C 从此再也起不来。
 void setPeripheralSwitches(bool enabled) {
-  digitalWrite(switch1Pin, enabled ? HIGH : LOW);
-  digitalWrite(switch2Pin, enabled ? HIGH : LOW);
-  digitalWrite(switch3Pin, enabled ? HIGH : LOW);
-  Serial.printf(
-    "[PWR] switch1=%s switch2=%s switch3=%s\n",
-    enabled ? "HIGH" : "LOW",
-    enabled ? "HIGH" : "LOW",
-    enabled ? "HIGH" : "LOW"
-  );
+  enableSensorRails(enabled);
 }
 
-// GPIO5 is the single hardware mode selector for the whole firmware:
+// modePin(GPIO12) is the single hardware mode selector for the whole firmware:
 // - LOW  => sensor logger mode
 // - HIGH => local display gateway mode
 bool isDisplayModeRequested() {
 #ifdef FORCE_DISPLAY_MODE
-  // 测试钩子：常驻模式要求 GPIO5 拉高，而那需要一根跳线。
+  // 测试钩子：常驻模式要求 modePin(GPIO12) 拉高，而那需要一根跳线。
   // 开这个宏可以在没有跳线的台面上验证四任务架构本身。
   // 只由 -DFORCE_DISPLAY_MODE 打开，正常构建里这段不存在。
   return true;
@@ -349,7 +355,7 @@ void printWakeupReason() {
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   switch (cause) {
     case ESP_SLEEP_WAKEUP_EXT0:
-      Serial.println("[WAKE] Wakeup caused by EXT0 (GPIO5 HIGH).");
+      Serial.println("[WAKE] Wakeup caused by EXT0 (GPIO12 HIGH).");
       break;
     case ESP_SLEEP_WAKEUP_TIMER:
       Serial.println("[WAKE] Wakeup caused by timer.");
@@ -476,7 +482,16 @@ bool readDht11(float& temperatureC, float& humidity) {
   humidity = data.humidity;
   temperatureC = data.temperature;
 
-  if (isnan(humidity) || isnan(temperatureC)) {
+  // ★ 2026-10-30：判据补一条「全 0 也算失败」。
+  // 原来只判 isnan，而 DHT11 读不到时返回的是 0.0/0.0 —— 【0.0 不是 NaN】，
+  // 原判据直接放它过去，一条 t=0.0 h=0.0 的垃圾读数会被当成有效测量写进记录。
+  // 和本仓库 A5 那条「batteryMv > 0 挡不住悬空 ADC」是同一个形状：
+  // 判据写的是「不是非法值」，想表达的是「读数有效」。
+  //
+  // 不加重试、不加延时：实测加了 2.4s 的重试与重新 setup 完全无效，
+  // 说明当前读不到的原因不在时序。原有节奏保持不变。
+  if (isnan(humidity) || isnan(temperatureC)
+      || (humidity == 0.0f && temperatureC == 0.0f)) {
     Serial.println("[DHT11] Failed to read from DHT11");
     return false;
   }
@@ -954,6 +969,15 @@ void initializeLoggerPeripherals() {
       Serial.println("[FFat] Flash storage unavailable for this cycle.");
     }
   }
+
+  // ★ 2026-10-30：上电标记行。
+  // 卡上是 append 的历史数据，光看记录分不出「这一行是这次启动写的」还是
+  // 「上次运行留下的」。排查 AS7343 时正是「线接回去但没复位、读的还是旧状态」
+  // 这个形状耗掉了很多时间 —— 标记行让每次上电在数据里留下明确的分界。
+  if (isStorageReady()) {
+    writeMeasurementRecord("2026/10/30 test：");
+    Serial.println("[SD] boot marker written.");
+  }
 }
 
 void initializeDisplayStorage() {
@@ -973,11 +997,16 @@ void setup() {
   delay(300);
 
   pinMode(led, OUTPUT);
-  pinMode(switch1Pin, OUTPUT);
-  pinMode(switch2Pin, OUTPUT);
-  pinMode(switch3Pin, OUTPUT);
+  // switch1/2/3Pin 在本板上是 I2C 线和未连接脚，【不配成 OUTPUT】——
+  // 配了就会在 Wire.begin() 之前/之后抢走 SCL。理由见 setPeripheralSwitches()。
   pinMode(batteryLedPin, OUTPUT);
-  pinMode((int)modePin, INPUT);
+  // ★ 2026-10-30：INPUT → INPUT_PULLDOWN。
+  // modePin 换到 GPIO12(J8 脚1) 之后【物理上悬空】——板上没有任何上下拉，
+  // 而 isDisplayModeRequested() 判的是 digitalRead()==HIGH，悬空脚读数随机，
+  // 开机进哪个模式就成了掷硬币。下拉让默认落在 LOW = logger 模式，
+  // 和本文件开头对 modePin 的定义一致。
+  // 深睡时保持低电平还顺带避免 EXT0(configureWakeSources) 被浮空噪声误唤醒。
+  pinMode((int)modePin, INPUT_PULLDOWN);
   setPeripheralSwitches(false);
   digitalWrite(batteryLedPin, LOW);
 
@@ -1011,7 +1040,7 @@ void setup() {
     return;
   }
 
-  Serial.println("[MODE] GPIO5 LOW -> logger mode.");
+  Serial.println("[MODE] GPIO12 LOW -> logger mode.");
   setPeripheralSwitches(true);
   initializeLoggerPeripherals();
   setPeripheralSwitches(false);
@@ -1030,11 +1059,11 @@ void setup() {
 // ====================== LOOP ======================
 void loop() {
   if (displayModeActive) {
-    // Display mode stays awake while GPIO5 remains HIGH. When GPIO5 stays LOW
+    // Display mode stays awake while GPIO12 remains HIGH. When GPIO12 stays LOW
     // for MODE_SWITCH_DELAY_MS, reboot so setup() can switch back to logger mode.
     if (isDisplayModeRequested()) {
       if (modePinLowTiming) {
-        Serial.println("[MODE] GPIO5 returned HIGH. Cancel logger switch countdown.");
+        Serial.println("[MODE] GPIO12 returned HIGH. Cancel logger switch countdown.");
         modePinLowTiming = false;
       }
       watchdogFeed();
@@ -1046,9 +1075,9 @@ void loop() {
     if (!modePinLowTiming) {
       modePinLowTiming = true;
       modePinLowStartMs = millis();
-      Serial.println("[MODE] GPIO5 went LOW. Start logger switch countdown...");
+      Serial.println("[MODE] GPIO12 went LOW. Start logger switch countdown...");
     } else if (millis() - modePinLowStartMs >= MODE_SWITCH_DELAY_MS) {
-      restartForModeSwitch("[MODE] GPIO5 stayed LOW long enough. Restarting into logger mode.");
+      restartForModeSwitch("[MODE] GPIO12 stayed LOW long enough. Restarting into logger mode.");
     }
 
     if (tasksRunning) { tasksIdle(); } else { displayGatewayLoop(); }
@@ -1089,9 +1118,9 @@ void loop() {
 
   // ================== Normal deep-sleep flow ==================
   if (elapsed_time >= AWAKE_DURATION_MS) {
-    // Allow GPIO5 HIGH to interrupt the logger cycle immediately.
+    // Allow GPIO12 HIGH to interrupt the logger cycle immediately.
     if (isDisplayModeRequested()) {
-      restartForModeSwitch("[MODE] GPIO5 HIGH detected. Restarting into display mode.");
+      restartForModeSwitch("[MODE] GPIO12 HIGH detected. Restarting into display mode.");
     }
 
     setPeripheralSwitches(true);
@@ -1140,7 +1169,7 @@ void loop() {
     Serial.println("Logger cycle complete. Entering timed deep sleep...");
     Serial.print("Device will wake up after ");
     Serial.print(SLEEP_DURATION_US / 1000000ULL);
-    Serial.println(" seconds, or immediately if GPIO5 goes HIGH.");
+    Serial.println(" seconds, or immediately if GPIO12 goes HIGH.");
     Serial.println("================================\n");
 
     delay(2000);
