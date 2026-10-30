@@ -14,11 +14,41 @@
 // ====================== CONSTANTS & PINS ======================
 const uint64_t SLEEP_DURATION_US = 10 * 1000000;   // sleep for 10 seconds
 const uint32_t AWAKE_DURATION_MS = 20 * 1000;      // awake for 20 seconds
-const uint32_t MODE_SWITCH_DELAY_MS = 5000;         // GPIO5 must stay LOW for 5s before leaving display mode
+const uint32_t MODE_SWITCH_DELAY_MS = 5000;         // modePin(GPIO12) must stay LOW for 5s before leaving display mode
 const uint32_t RECORD_EVERY_SAMPLE_COUNT = 50;      // write one record every 50 samples
 const int STORAGE_MODE = 0;                         // 0 = SD card, 1 = FFat flash
 int led = LED_BUILTIN;
-const gpio_num_t modePin = GPIO_NUM_5;              // LOW = logger mode, HIGH = display mode
+// ★ 2026-10-30：从 GPIO5 换到 GPIO12。
+// GPIO5 在本板上是 J5 三脚传感器的信号脚（DHT11 插这儿），和模式选择【撞脚】——
+// DHT11 模块的上拉让 GPIO5 恒为 HIGH，于是固件永远进 display 模式、永远进不了 logger。
+// GPIO12 是 J8 六脚排针的第 1 脚，本板上空着。
+// 选它还有一个硬约束：configureWakeSources() 用 modePin 做 EXT0 深睡唤醒源，
+// 而 EXT0 要求 RTC GPIO —— ESP32-S3 的 RTC GPIO 只有 GPIO0~21。
+// J8 那六个脚（GPIO12~17）都在范围内，GPIO35 那类就不行。
+const gpio_num_t modePin = GPIO_NUM_12;             // LOW = logger mode, HIGH = display mode
+
+// ---- 固态继电器 ASSR-1218：拉高才给对应那一路传感器供电 ----
+// 来源 StarvedLogger_PCB.kicad_pcb，完整表见 hardware/PINOUT.md。
+// 【为什么必须显式管】不拉高时传感器【完全没电】，而没电的 I2C/单总线
+// 初始化仍可能逐步"返回成功"（库只检查通信错误，不回读验证），
+// 症状只剩「读数恒 0 且不随环境变化」—— 和传感器损坏完全同构。
+const int ssr3v3SensorPin  = 33;   // U6 -> /3.3v Sensor   -> J6 四脚 3.3V I2C
+const int ssr3v3Sensor1Pin = 47;   // U5 -> /3.3v Sensor_1 -> J5 三脚 3.3V 单总线（DHT11）
+const int ssr6vSensorPin   = 26;   // U4 -> /6v Sensor     -> J7 三脚 6V
+const int ssr6vSensor1Pin  = 18;   // U7 -> /6v Sensor_1   -> J4 四脚 5V I2C
+const uint32_t SENSOR_RAIL_SETTLE_MS = 500;   // 合闸后等轨电压建立 + 传感器上电复位
+
+void enableSensorRails(bool on) {
+  const int pins[] = {ssr3v3SensorPin, ssr3v3Sensor1Pin,
+                      ssr6vSensorPin, ssr6vSensor1Pin};
+  for (int pin : pins) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, on ? HIGH : LOW);
+  }
+  Serial.printf("[RAIL] sensor rails %s (GPIO %d/%d/%d/%d)\n",
+                on ? "ON" : "OFF", ssr3v3SensorPin, ssr3v3Sensor1Pin,
+                ssr6vSensorPin, ssr6vSensor1Pin);
+}
 
 const int switch1Pin = T10;
 const int switch2Pin = T6;
@@ -26,8 +56,18 @@ const int switch3Pin = T9;
 const int batteryLedPin = T13;
 
 
-const int sensor1Pin = A3;   // DHT11 data pin, use the real GPIO number 
-const int sensor2Pin = A4;    // soil moisture sensor analog input
+// ★ 2026-10-30：A3(GPIO15) → GPIO5。本板 J5 三脚 3.3V 传感器的信号脚经 R5 1k 接 GPIO5。
+// 原来的 A3 是 Adafruit Feather variant 的别名，在本板上是 J8 的空脚。
+// 供电走 U5 固态继电器（GPIO47），不拉高没电。
+const int sensor1Pin = 5;    // DHT11 data pin -> J5 Pin_3
+// ⚠️ 2026-10-30 未改，因为改不了 —— 这是个【硬件问题】，需要人决定：
+//   · A4 = GPIO14，在本板上是 J8 六脚排针的第 3 脚，【空着】，
+//     analogRead 读到的是悬空噪声（几百 mV，不是 0 —— 见下面 A5 那条注释的同款坑）
+//   · 本板只剩 J7 一个三脚模拟插座，信号脚是 GPIO21
+//   · 但 ESP32-S3 的 ADC 只有 GPIO1~10(ADC1) 和 GPIO11~20(ADC2)，
+//     【GPIO21 根本不是 ADC 脚】，analogRead(21) 不可能工作
+// 所以土壤湿度在这块板上没有可用的模拟通道。要么改板、要么换成数字/I2C 的湿度传感器。
+const int sensor2Pin = A4;    // soil moisture sensor analog input -- 见上，本板无效
 // ★ 2026-10-30：SD 卡四根线按 StarvedLogger_PCB.kicad_pcb 的网表改正。
 //
 // 【改之前是错的，而且错了三条】原来是 `SDcardPin = T12`（GPIO12）加裸
@@ -52,11 +92,17 @@ const int SDcardPin = 35;    // /CS  → U1 封装脚 31
 const int SD_MOSI   = 36;    // /DI  → U1 封装脚 32（主→卡）
 const int SD_MISO   = 37;    // /DO  → U1 封装脚 33（卡→主）
 const int SD_SCK    = 38;    // /CLK → U1 封装脚 34
-const int batteryAdcPin = A2;
+// ★ 2026-10-30：A2(GPIO16) → GPIO2。本板 /BAT_SENSE 网络接 U1 封装脚 6 = GPIO2（ADC1_CH1）。
+// 实测佐证：三态扫描里 GPIO2 恒 3118 且 spread=0，是全板唯一的低阻分压输出。
+const int batteryAdcPin = 2;
 const char* DISPLAY_SENSOR_TYPE = "Soil moisture + DHT11 + AS7343";
 const char* DISPLAY_DATA_FILE = "/sensor_log.txt";
 const float ADC_VREF = 3.3f;
-const float BATTERY_DIVIDER_RATIO = 3.0f;
+// ★ 2026-10-30：3.0 → 2.0。网表上 /BAT_SENSE 只接两颗电阻：
+// R11 10k 接 +6V、R10 10k 接 GND，分压比 = (10+10)/10 = 2.0。
+// 原来的 3.0 和档案里写的「200k/100k 分压」都是【旧台面接线】的参数，不是这块 PCB。
+// 按 3.0 算会让电压虚高 50%（6V 的电池显示成 9V），直接影响下面的低电压截止判定。
+const float BATTERY_DIVIDER_RATIO = 2.0f;
 const float BATTERY_LOW_THRESHOLD_V = 4.0f;
 
 // ★ A5：低电压截止。
@@ -316,14 +362,14 @@ void printWakeupReason() {
 
 // Logger mode uses both wake sources:
 // 1. timer wakeup for the next sampling cycle
-// 2. EXT0 wakeup on GPIO5 HIGH so the user can force display mode while asleep
+// 2. EXT0 wakeup on modePin(GPIO12) HIGH so the user can force display mode while asleep
 void configureWakeSources() {
   esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
   esp_sleep_enable_ext0_wakeup(modePin, 1);
 }
 
 // A reboot is the cleanest way to switch modes at runtime because setup()
-// re-runs the same initialization path and re-evaluates GPIO5.
+// re-runs the same initialization path and re-evaluates modePin.
 void restartForModeSwitch(const char* reason) {
   Serial.println(reason);
   Serial.flush();
@@ -386,7 +432,9 @@ bool readDht11(float& temperatureC, float& humidity) {
 
 bool initSpectralSensor() {
   Serial.println("[AS7343] Initializing...");
-  Wire.begin(3,4);
+  // ★ 2026-10-30：(3,4) → (8,9)。本板 3.3V I2C 是 GPIO8(SDA)/GPIO9(SCL)，
+  // 总线上有 R8/R? 4.7k 上拉。原来的 (3,4) 是 Feather 的 SDA/SCL 别名。
+  Wire.begin(8, 9);
   Wire.setClock(100000);
 
   if (!spectralSensor.begin(0x39, Wire)) {
@@ -862,17 +910,22 @@ void setup() {
   setPeripheralSwitches(false);
   digitalWrite(batteryLedPin, LOW);
 
+  // ★ 2026-10-30：先给传感器那几路上电，再做任何传感器初始化。
+  // 顺序反了的话 begin() 会在没电的总线上跑完并"成功"，之后读数恒 0。
+  enableSensorRails(true);
+  delay(SENSOR_RAIL_SETTLE_MS);
+
   analogReadResolution(12);
   analogSetPinAttenuation(sensor2Pin, ADC_11db);
   analogSetPinAttenuation(batteryAdcPin, ADC_11db);
   printWakeupReason();
 
-  // Sample GPIO5 only here to decide which runtime branch should own loop().
+  // Sample modePin (GPIO12) only here to decide which runtime branch should own loop().
   // HIGH means the user wants the local AP/web UI; LOW keeps normal logging.
   displayModeActive = isDisplayModeRequested();
 
   if (displayModeActive) {
-    Serial.println("[MODE] GPIO5 HIGH -> display mode.");
+    Serial.println("[MODE] GPIO12 HIGH -> display mode.");
     initializeDisplayStorage();
     displayGatewaySetup();
     logResourceWatermark("display-boot");
