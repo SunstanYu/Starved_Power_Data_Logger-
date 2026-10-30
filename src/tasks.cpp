@@ -53,7 +53,9 @@ extern bool readDht11(float& temperatureC, float& humidity);
 extern int readSpectralChannels(uint16_t* channels, size_t channelCapacity);
 extern String buildMeasurementRecord(int moisture, int batteryMv, float temperatureC,
                                      float humidity, bool dhtOk,
-                                     const uint16_t* spectralChannels, int spectralCount);
+                                     const uint16_t* spectralChannels, int spectralCount,
+                                     float boardTempC, bool tmpOk);
+extern bool readTmp117(float& degC);
 extern void writeMeasurementRecord(const String& record);
 extern bool isStorageReady();
 extern void setPeripheralSwitches(bool enabled);
@@ -179,12 +181,14 @@ static void sensorTask(void*) {
     int batteryMv = getBatteryMv();
     float t = 0.0f, h = 0.0f;
     bool dhtOk = readDht11(t, h);            // ← 这里会阻塞 ~2.5s，Net 任务照跑
+    float boardTempC = 0.0f;
+    bool tmpOk = readTmp117(boardTempC);     // I2C 单次事务，不阻塞
     int n = readSpectralChannels(spectralChannels, 12);
 
     setPeripheralSwitches(false);
 
     String rec = buildMeasurementRecord(moisture, batteryMv, t, h, dhtOk,
-                                        spectralChannels, n);
+                                        spectralChannels, n, boardTempC, tmpOk);
     publishLatest(rec);                      // 网页立刻就能看到，不用等落盘
 
     RecordMsg msg;

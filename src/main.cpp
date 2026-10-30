@@ -386,6 +386,65 @@ void enterTimedDeepSleep() {
   esp_deep_sleep_start();
 }
 
+// ---- I2C 总线（GPIO8=SDA / GPIO9=SCL，总线自带 4.7k 上拉）----
+// 单独成函数：这条总线上挂着两个来源完全不同的器件 ——
+// TMP117 是板载、+3.3V 直供、永远在线；AS7343 是插在 J6 上、受 U6 继电器(GPIO33)控制。
+// 总线初始化必须早于两者，且不能埋在任何一个器件的 init 里。
+void initI2cBus() {
+  Wire.begin(8, 9);
+  Wire.setClock(100000);
+  Serial.println("[I2C] bus up on SDA=8 SCL=9 @100kHz");
+}
+
+// ---- TMP117 板载温度传感器（U2 @ 0x48）----
+// 不引库：寄存器就三个，裸 I2C 比多一个依赖干净。
+//   0x00 温度结果  16 位有符号，7.8125 m°C/LSB
+//   0x0F 器件 ID   固定 0x0117
+// 2026-10-30 上板实测：ID 读回 0x0117，31.8~32.1°C，抖动 24~101 m°C，23 轮零失败。
+const uint8_t TMP117_ADDR      = 0x48;   // ADD0 接 GND
+const uint8_t TMP117_REG_TEMP  = 0x00;
+const uint8_t TMP117_REG_ID    = 0x0F;
+const uint16_t TMP117_DEVICE_ID = 0x0117;
+bool tmp117Ready = false;
+
+static bool tmp117Read16(uint8_t reg, uint16_t& out) {
+  Wire.beginTransmission(TMP117_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;   // repeated start
+  if (Wire.requestFrom((int)TMP117_ADDR, 2) != 2) return false;
+  out = ((uint16_t)Wire.read() << 8) | Wire.read();     // 大端
+  return true;
+}
+
+bool initTmp117() {
+  uint16_t id = 0;
+  if (!tmp117Read16(TMP117_REG_ID, id)) {
+    Serial.println("[TMP117] no response at 0x48.");
+    return false;
+  }
+  // ★ 判据是器件 ID，不是「地址有应答」。
+  // 地址应答只说明总线上有东西；读到 0x0117 才说明那东西是 TMP117。
+  // 这是今天反复撞到的那个形状的解药：「调用没报错」≠「拿到的是对的东西」。
+  if (id != TMP117_DEVICE_ID) {
+    Serial.printf("[TMP117] wrong device id 0x%04X (expect 0x%04X).\n", id, TMP117_DEVICE_ID);
+    return false;
+  }
+  Serial.println("[TMP117] ready, id=0x0117.");
+  return true;
+}
+
+bool readTmp117(float& degC) {
+  if (!tmp117Ready) return false;
+  uint16_t v;
+  if (!tmp117Read16(TMP117_REG_TEMP, v)) {
+    Serial.println("[TMP117] read failed.");
+    return false;
+  }
+  degC = (int16_t)v * 0.0078125f;
+  Serial.printf("[TMP117] Board temperature: %.4f C\n", degC);
+  return true;
+}
+
 int getMoisture() {
   int value = analogRead(sensor2Pin);
   Serial.print("Soil moisture raw value: ");
@@ -432,9 +491,9 @@ bool readDht11(float& temperatureC, float& humidity) {
 
 bool initSpectralSensor() {
   Serial.println("[AS7343] Initializing...");
-  // ★ 2026-10-30：(3,4) → (8,9)。本板 3.3V I2C 是 GPIO8(SDA)/GPIO9(SCL)，
-  // 总线上有 R8/R? 4.7k 上拉。原来的 (3,4) 是 Feather 的 SDA/SCL 别名。
-  Wire.begin(8, 9);
+  // I2C 总线已由 setup() 的 initI2cBus() 初始化 —— 不在这里 begin。
+  // 原因：TMP117(U2) 和 AS7343 共用这条总线，但 TMP117 是 +3.3V 直供、
+  // 永远在线，不该因为 AS7343 初始化失败或顺序调整就读不到。
   Wire.setClock(100000);
 
   if (!spectralSensor.begin(0x39, Wire)) {
@@ -527,7 +586,9 @@ String buildMeasurementRecord(
   float humidity,
   bool dhtOk,
   const uint16_t* channels,
-  int channelCount
+  int channelCount,
+  float boardTempC,
+  bool tmpOk
 ) {
   time_t now = time(nullptr);
   struct tm timeinfo;
@@ -573,6 +634,14 @@ String buildMeasurementRecord(
   record += dhtOk ? "ok" : "read_fail";
   // ★ A3：时钟来源。没对过时只有相对时间（time_ms + 采样序号），
   // 下游据此判断 time= 字段可不可信，而不是看到有值就当真。
+  // ★ 2026-10-30 新增：TMP117 板载温度。和 DHT11 的 temp_c 是两回事 ——
+  // DHT11 量的是 J5 外接探头处的环境温度，TMP117 焊在板上、量的是板子自身温度
+  // （实测比室温高几度，挨着 ESP32 有自热）。两个都留着，别合并。
+  // 质量位同样显式给，理由见上面 A7 那条。
+  record += ",board_temp_c=";
+  record += tmpOk ? String(boardTempC, 4) : String("nan");
+  record += ",tmp_q=";
+  record += tmpOk ? "ok" : "read_fail";
   record += ",clk=";
   record += (now > 1700000000) ? "synced" : "uptime_only";
   record += ",spectral=";
@@ -867,7 +936,9 @@ void initializeLoggerPeripherals() {
   dht.setup(sensor1Pin, DHTesp::DHT11);
   Serial.printf("[DHT11] setup done on GPIO %d.\n", sensor1Pin);
 
+  initI2cBus();                       // 必须早于 TMP117 和 AS7343
   spectralReady = initSpectralSensor();
+  tmp117Ready = initTmp117();         // 板载、直供，和 AS7343 成败无关
   if (!spectralReady) {
     Serial.println("[AS7343] Spectral sensor unavailable for this cycle.");
   }
@@ -1035,6 +1106,8 @@ void loop() {
     float temperatureC = 0.0f;
     float humidity = 0.0f;
     bool dhtOk = readDht11(temperatureC, humidity);
+    float boardTempC = 0.0f;
+    bool tmpOk = readTmp117(boardTempC);
     int spectralCount = readSpectralChannels(spectralChannels, ksfAS7343NumChannels);
 
     sampleCounter++;
@@ -1049,7 +1122,9 @@ void loop() {
           humidity,
           dhtOk,
           spectralChannels,
-          spectralCount
+          spectralCount,
+          boardTempC,
+          tmpOk
         );
         writeMeasurementRecord(record);
       } else {
