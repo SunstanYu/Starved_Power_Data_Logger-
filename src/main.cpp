@@ -14,23 +14,33 @@
 #include "tasks.h"
 
 // ====================== CONSTANTS & PINS ======================
-const uint64_t SLEEP_DURATION_US = 10 * 1000000;   // sleep for 10 seconds
-const uint32_t AWAKE_DURATION_MS = 20 * 1000;      // awake for 20 seconds
+// ★ 2026-11-09：一分钟一轮，一小时一条。睡眠时长【反算】，不再写死。
+//
+// 【为什么不再写死睡眠时长】原来是「醒 20s + 睡 10s」，然后按 30s 一轮推出
+// 「一小时 = 120 轮」。但实测一轮是 36.6s —— 采样工作（导轨稳定 1.5s +
+// DHT11 约 2.5s + AS7343 积分 + 落盘前 delay(2000)）比 AWAKE_DURATION_MS
+// 多出约 6.6s，而那个推导假设「醒着的时间 == AWAKE_DURATION_MS」。
+// 结果「每小时一条」实际是每 73 分钟一条，偏 22%，注释却写着一小时。
+//
+// 现在反过来：先定一轮多长，睡前用
+//     睡眠 = 周期 - 这一轮已经醒了多久(millis())
+// 算出来（millis() 在深睡唤醒后从 0 重新开始，所以它就是本轮醒着的时长）。
+// 采样快慢不再影响周期，上面那个偏差从根上消失。
+const uint32_t CYCLE_PERIOD_MS = 60UL * 1000UL;    // 一轮（醒+睡）= 1 分钟
+const uint32_t AWAKE_DURATION_MS = 20 * 1000;      // 采样前的等待窗口
+const uint32_t MIN_SLEEP_MS = 1000;                // 醒着超出周期时的兜底睡眠
 const uint32_t MODE_SWITCH_DELAY_MS = 5000;         // modePin(GPIO12) must stay LOW for 5s before leaving display mode
-// ★ 2026-10-30：改成「每小时一条」。
-//
-// 【为什么从周期推导而不是写死】原来写死 50，含义依赖于当时的醒/睡时长
-// （一轮一个样本，30s 一轮 → 25 分钟一条）。改了上面任何一个时长，
-// 这个数就悄悄变成别的意思，而注释不会跟着变。
-// 推导出来则「一小时一条」这个【意图】被编码进代码，改时长也不会漂。
-//
-// 当前值：(20000 + 10000) ms 一轮 → 3600000 / 30000 = 120 个样本 = 1 小时。
-// 注意这是按唤醒次数算的近似值：深睡定时器有漂移，不等于墙上时钟的整点。
-// 记录里的 clk= 字段标明时间来源是否可信，下游据此判断。
-const uint32_t LOGGER_CYCLE_MS = AWAKE_DURATION_MS + (uint32_t)(SLEEP_DURATION_US / 1000ULL);
+// 落盘间隔。注意【不再按轮数判断】—— 改成累计真实经过的毫秒数，
+// 理由见下面 msSinceRecord 的注释。
 const uint32_t RECORD_INTERVAL_MS = 60UL * 60UL * 1000UL;   // 一小时
-static_assert(LOGGER_CYCLE_MS > 0, "醒+睡时长不能都是 0，否则下面要除零");
-const uint32_t RECORD_EVERY_SAMPLE_COUNT = RECORD_INTERVAL_MS / LOGGER_CYCLE_MS;
+
+// 本轮该睡多久。awakeMs 传 millis()。
+uint32_t plannedSleepMs(uint32_t awakeMs) {
+  if (awakeMs + MIN_SLEEP_MS >= CYCLE_PERIOD_MS) {
+    return MIN_SLEEP_MS;   // 采样异常拖长，别算出负数或 0
+  }
+  return CYCLE_PERIOD_MS - awakeMs;
+}
 const int STORAGE_MODE = 0;                         // 0 = SD card, 1 = FFat flash
 int led = LED_BUILTIN;
 // ★ 2026-10-30：从 GPIO5 换到 GPIO12。
@@ -267,7 +277,40 @@ bool displayModeActive = false;
 bool tasksRunning = false;      // ★ A8：四任务是否起来了
 bool modePinLowTiming = false;
 unsigned long modePinLowStartMs = 0;
-RTC_DATA_ATTR uint32_t sampleCounter = 0;
+// ★ 2026-11-09：RTC_DATA_ATTR → RTC_NOINIT_ATTR，并新增「累计时间」。
+//
+// 【为什么换 NOINIT】.rtc.data 是【要从 flash 加载】的段（链接脚本里没有
+// NOLOAD），`= 0` 这个初值存在固件镜像里，非深睡启动时会被重新写回。
+// 也就是说 ESP.restart() / 按复位 / 上电，全都会把计数清零。
+//
+// 【实测代价】J8 第1脚(GPIO12 = modePin)物理悬空，手在旁边第3脚插拔线就
+// 可能让它读到一次 HIGH → restartForModeSwitch() → ESP.restart() → 归零。
+// 2026-11-09 实测：8 分钟内发生 4 次，卡上只留下 4 行标记、0 行数据。
+//
+// .rtc_noinit 是 NOLOAD 段，没有初值要写回，所以只有【真正断电】才丢。
+// 代价是上电时内容是随机值，必须自己用幻数判断「初始化过没有」。
+// 不用 NVS 是因为那要写 flash，而这是个 starved power 节点。
+const uint32_t RTC_STATE_MAGIC = 0x5A4C4F47;   // 'ZLOG'
+RTC_NOINIT_ATTR uint32_t rtcStateMagic;
+RTC_NOINIT_ATTR uint32_t sampleCounter;
+// 距上次落盘累计了多少毫秒。【累计真实时间而不是数轮数】：
+// 数轮数要求「每轮多长」是个已知常量，而那正是上面出 22% 偏差的原因。
+// 累计实际经过的时长，无论采样快慢、周期改成多少，「一小时一条」都成立。
+RTC_NOINIT_ATTR uint32_t msSinceRecord;
+
+void initRtcState() {
+  if (rtcStateMagic == RTC_STATE_MAGIC) {
+    Serial.printf("[RTC] 状态保留：sample=%lu，距上次落盘 %lu ms\n",
+                  (unsigned long)sampleCounter, (unsigned long)msSinceRecord);
+    return;
+  }
+  rtcStateMagic = RTC_STATE_MAGIC;
+  sampleCounter = 0;
+  // 冷启动让第一轮【立刻】落一条：给耗电测试一个 t=0 基准，
+  // 也免得要等满一小时才能确认落盘链路是通的。
+  msSinceRecord = RECORD_INTERVAL_MS;
+  Serial.println("[RTC] 冷启动（断过电）：计数归零，第一轮立即落盘");
+}
 
 // ====================== HELPERS ======================
 
@@ -417,8 +460,8 @@ void printWakeupReason() {
 // Logger mode uses both wake sources:
 // 1. timer wakeup for the next sampling cycle
 // 2. EXT0 wakeup on modePin(GPIO12) HIGH so the user can force display mode while asleep
-void configureWakeSources() {
-  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
+void configureWakeSources(uint32_t sleepMs) {
+  esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
   esp_sleep_enable_ext0_wakeup(modePin, 1);
 
   // ★ 2026-10-30：深睡期间把 modePin 焊盘下拉住。
@@ -444,9 +487,14 @@ void restartForModeSwitch(const char* reason) {
   ESP.restart();
 }
 
-void enterTimedDeepSleep() {
-  Serial.println("[SLEEP] Preparing to enter deep sleep...");
-  configureWakeSources();
+// awakeMs 由调用方传入而不是在这里取 millis()：打印的必须是【实际参与
+// 睡眠时长计算的那个值】，否则日志里 醒+睡 不等于周期，核对时会误判成 bug。
+void enterTimedDeepSleep(uint32_t awakeMs, uint32_t sleepMs) {
+  Serial.printf("[SLEEP] 本轮醒了 %lu ms + 睡 %lu ms = %lu ms（周期目标 %lu ms）\n",
+                (unsigned long)awakeMs, (unsigned long)sleepMs,
+                (unsigned long)(awakeMs + sleepMs),
+                (unsigned long)CYCLE_PERIOD_MS);
+  configureWakeSources(sleepMs);
   Serial.println("[SLEEP] Entering deep sleep now.");
   Serial.flush();
   delay(100);
@@ -1167,6 +1215,10 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
+  // 必须在任何人读 sampleCounter / msSinceRecord 之前跑：
+  // 这两个在 .rtc_noinit 段，断电后是随机值。
+  initRtcState();
+
   pinMode(led, OUTPUT);
   // switch1/2/3Pin 在本板上是 I2C 线和未连接脚，【不配成 OUTPUT】——
   // 配了就会在 Wire.begin() 之前/之后抢走 SCL。理由见 setPeripheralSwitches()。
@@ -1313,9 +1365,13 @@ void loop() {
     int spectralCount = readSpectralChannels(spectralChannels, ksfAS7343NumChannels);
 
     sampleCounter++;
-    Serial.printf("[SAMPLE] Count=%lu, record every %lu samples.\n", (unsigned long)sampleCounter, (unsigned long)RECORD_EVERY_SAMPLE_COUNT);
+    Serial.printf("[SAMPLE] Count=%lu，距上次落盘 %lu/%lu ms\n",
+                  (unsigned long)sampleCounter,
+                  (unsigned long)msSinceRecord, (unsigned long)RECORD_INTERVAL_MS);
 
-    if (sampleCounter % RECORD_EVERY_SAMPLE_COUNT == 0) {
+    // 用的是【上一轮睡前累加到的值】—— 这一轮的时长要等算出睡眠时长才知道，
+    // 在下面进深睡之前才加。
+    if (msSinceRecord >= RECORD_INTERVAL_MS) {
       if (isStorageReady()) {
         String record = buildMeasurementRecord(
           soilMv,
@@ -1331,29 +1387,32 @@ void loop() {
           tmpOk
         );
         writeMeasurementRecord(record);
+        // ★ 扣减 RECORD_INTERVAL_MS 而不是归零：周期不可能正好整除一小时，
+        // 归零会把每次的零头丢掉，累积成系统性偏慢。扣减把余量带到下一轮。
+        msSinceRecord -= RECORD_INTERVAL_MS;
       } else {
         Serial.printf("[%s] Storage unavailable. Measurement not recorded.\n", getStorageName());
+        // 卡坏了【不扣减】：下一轮还会再试，不要因为写失败就把这一小时吞掉。
       }
     } else {
-      Serial.println("[SAMPLE] Measurement sampled but not recorded this cycle.");
+      Serial.println("[SAMPLE] 本轮只采样不落盘（未满一小时）");
     }
 
     logResourceWatermark("post-sample");   // 每轮落一条，跑几天就能看出趋势
 
     Serial.println("\n================================");
     Serial.println("Logger cycle complete. Entering timed deep sleep...");
-    Serial.print("Device will wake up after ");
-    Serial.print(SLEEP_DURATION_US / 1000000ULL);
-    Serial.println(" seconds, or immediately if GPIO12 goes HIGH.");
     Serial.println("================================\n");
 
     delay(2000);
     //delay>1s才能给DHT11留出采样时间
     setPeripheralSwitches(false);
-    // Deep-sleep is temporarily disabled for debugging. Keep the same timing
-    // budget by delaying for the original sleep interval, then restart the
-    // awake window timer for the next sample cycle.
-    enterTimedDeepSleep();
+
+    // 导轨断完再算：millis() 到这里才是本轮真实的醒着时长。
+    uint32_t awakeMs = millis();
+    uint32_t sleepMs = plannedSleepMs(awakeMs);
+    msSinceRecord += awakeMs + sleepMs;
+    enterTimedDeepSleep(awakeMs, sleepMs);
 
     // 2) D6 HIGH wakeup (EXT0)
     //    Note: EXT0 uses RTC IO; GPIO6 is a RTC IO on ESP32-S3 and is usable
@@ -1362,8 +1421,6 @@ void loop() {
     
     // Enter deep-sleep (program 'powers off' here; on wake, starts from setup())
     return;
-    //模拟deepsleep
-    // delay(SLEEP_DURATION_US / 1000);
     
   }
 
