@@ -109,8 +109,10 @@ const int soilAdcPin = A4;    // = GPIO14 = J8 第3脚 = ADC2_CH3；VH400 的 OU
 // 同时也贴着 ADC 自己的天花板 —— 读到这个值意味着「要么传感器异常，要么 ADC 饱和」，
 // 两种都不该当数据用，所以合成一个 SOIL_RANGE 就够了。
 const int SOIL_OUT_MAX_MV = 3100;
-// 三态极差阈值：悬空约 3300mV，VH400 在位约 600mV，放中间。
-const int SOIL_FLOAT_SPREAD_MV = 1500;
+// 在位判据的两条轨。判「是否被钉在两条轨上」，不判「极差多大」——
+// 理由见 readSoilMoisture() 里的长注释。
+const int SOIL_RAIL_LO_MV = 150;
+const int SOIL_RAIL_HI_MV = 3100;
 
 // 质量位用字符串而不是 enum，有个具体理由：本工程的 main.cpp 是当 .ino 编的
 // （getBatteryMv 在 302 行用、496 行才定义，靠 Arduino 预处理自动插原型才过），
@@ -540,11 +542,21 @@ float vh400VwcPercent(float v) {
 // 像一条正常数据。光看数值永远分不出「传感器在工作」和「线掉了」。
 // 这是本项目栽过五次的同一个形状：「调用没报错」≠「动作生效了」。
 //
-// 【判据：三态极差】给引脚加片内上拉/下拉（约 45k）各读一次：
-//   · 悬空        → 下拉拉到 ~0V，上拉拉到 ~3.3V，极差约 3300mV
-//   · VH400 在位  → 输出阻抗 10k，被 45k 拉动有限，极差约 10/55*3300 ≈ 600mV
-// 5 倍差距，阈值放 1500mV 很宽裕。这个方法在本板上有实测依据：2026-10-29
-// 的三态扫描里，悬空脚极差都在千级，低阻驱动的脚极差≈0（见 hardware/PINOUT.md）。
+// 【判据：两条轨是否同时被钉住】给引脚加片内下拉、再加片内上拉，各读一次：
+//   · 悬空        → 下拉拉到 ≈0V，上拉拉到 ≈3300mV，【两条轨都钉住】
+//   · VH400 在位  → 输出阻抗 10k，至少有一条轨钉不住
+// 所以判据是 (vDown < 150mV) AND (vUp > 3100mV)。
+//
+// 【为什么不用「极差 > 阈值」】第一版就是那么写的（阈值 1500mV），错了。
+// 那个阈值依赖「片内上下拉约 45k」这个我没验证过的数字：
+//     45k → 在位极差 3300*10/55 ≈  600mV   阈值之下，判对
+//     10k → 在位极差 3300*10/20 ≈ 1650mV   【超过 1500，误判成悬空】
+// 片内拉阻芯片间差异很大，而误判的后果是最坏的那种 —— 传感器明明在工作，
+// 每轮都报 absent、vwc_pct 恒 nan，我加的"安全检查"把好数据杀掉。
+//
+// 换成判两条轨之后，10k 源阻抗不可能同时被拉到两条轨，所以对任意片内拉阻
+// （10k~80k 扫过）× 任意 VH400 输出（0~3V 扫过）共 20 种组合全部判对，
+// 真悬空也判对。判据不再依赖任何未验证的数字。
 //
 // 这项检查【每轮都做】而不是只在开机做一次 —— 松线是会在运行中发生的，
 // AS7343 那次就是这么耗掉大半天的。每轮多 3 次 analogRead，成本可以忽略。
@@ -559,9 +571,9 @@ const char* readSoilMoisture(int& mv, float& vwcPct) {
   pinMode(soilAdcPin, INPUT);
   int spread = vUp - vDown;
 
-  if (spread > SOIL_FLOAT_SPREAD_MV) {
-    Serial.printf("[SOIL] 悬空：三态极差 %dmV > %dmV（下拉 %d / 上拉 %d）—— 线没接或掉了\n",
-                  spread, SOIL_FLOAT_SPREAD_MV, vDown, vUp);
+  if (vDown < SOIL_RAIL_LO_MV && vUp > SOIL_RAIL_HI_MV) {
+    Serial.printf("[SOIL] 悬空：下拉 %dmV<%d 且 上拉 %dmV>%d，两条轨都被钉住 —— 线没接或掉了\n",
+                  vDown, SOIL_RAIL_LO_MV, vUp, SOIL_RAIL_HI_MV);
     return "absent";
   }
 
@@ -580,13 +592,14 @@ const char* readSoilMoisture(int& mv, float& vwcPct) {
   mv = samples[2];
 
   if (mv > SOIL_OUT_MAX_MV) {
-    Serial.printf("[SOIL] 超量程：%dmV > VH400 输出上限 %dmV（三态极差 %dmV）\n",
-                  mv, SOIL_OUT_MAX_MV, spread);
+    Serial.printf("[SOIL] 超量程：%dmV > VH400 输出上限 %dmV（下拉 %d / 上拉 %d）\n",
+                  mv, SOIL_OUT_MAX_MV, vDown, vUp);
     return "range";
   }
 
   vwcPct = vh400VwcPercent((float)mv / 1000.0f);
-  Serial.printf("[SOIL] %dmV -> VWC %.1f%%（三态极差 %dmV）\n", mv, vwcPct, spread);
+  Serial.printf("[SOIL] %dmV -> VWC %.1f%%（下拉 %d / 上拉 %d，极差 %d）\n",
+                mv, vwcPct, vDown, vUp, spread);
   return "ok";
 }
 
