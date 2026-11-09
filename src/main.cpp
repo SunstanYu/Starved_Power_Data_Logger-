@@ -86,14 +86,38 @@ const int batteryLedPin = T13;
 // 原来的 A3 是 Adafruit Feather variant 的别名，在本板上是 J8 的空脚。
 // 供电走 U5 固态继电器（GPIO47），不拉高没电。
 const int sensor1Pin = 5;    // DHT11 data pin -> J5 Pin_3
-// ⚠️ 2026-10-30 未改，因为改不了 —— 这是个【硬件问题】，需要人决定：
-//   · A4 = GPIO14，在本板上是 J8 六脚排针的第 3 脚，【空着】，
-//     analogRead 读到的是悬空噪声（几百 mV，不是 0 —— 见下面 A5 那条注释的同款坑）
-//   · 本板只剩 J7 一个三脚模拟插座，信号脚是 GPIO21
-//   · 但 ESP32-S3 的 ADC 只有 GPIO1~10(ADC1) 和 GPIO11~20(ADC2)，
-//     【GPIO21 根本不是 ADC 脚】，analogRead(21) 不可能工作
-// 所以土壤湿度在这块板上没有可用的模拟通道。要么改板、要么换成数字/I2C 的湿度传感器。
-const int sensor2Pin = A4;    // soil moisture sensor analog input -- 见上，本板无效
+// ★ 2026-11-09：土壤湿度（Vegetronix VH400）启用。引脚值没变，但含义完全变了。
+//
+// 【为什么不是 J7】J7 是本板唯一的三脚模拟插座，但它的信号脚经 R4 1k 接 GPIO21，
+// 而 ESP32-S3 的 ADC 只覆盖 GPIO1~10(ADC1) 和 GPIO11~20(ADC2) ——
+// 【GPIO21 不是 ADC 脚】。analogRead(21) 不报错，返回垃圾。
+// 依据：soc/esp32s3/include/soc/adc_channel.h，ADC2_GPIO20_CHANNEL 是最后一个。
+//
+// 【现在怎么接】VH400 三根线拆成两个插座：
+//     红线(POWER) → J7 第1脚  /6v Sensor（SSR U4 / GPIO26 控制，不拉高没电）
+//     裸线(GND)   → J7 第2脚  GND         ← J8 整排都是纯 GPIO，没有 GND 脚，所以必须留在 J7
+//     黑线(OUT)   → J8 第3脚  GPIO14      ← 2026-11-09 实接
+// J7 第3脚（→R4→GPIO21）从此空置。
+//
+// 【为什么 6V 供电是安全的】VH400 供电范围 3.5~20VDC，输出固定 0~3V 不随供电摆动，
+// 所以不需要分压。这跟廉价电阻式模块（输出跟着 VCC 走）完全不同，别混。
+// 规格来源：vegetronix.com/Products/VH400/ 规格表。
+const int soilAdcPin = A4;    // = GPIO14 = J8 第3脚 = ADC2_CH3；VH400 的 OUT（黑线）
+
+// VH400 输出上限 3.0V，留 100mV 余量当超量程判据。
+// 注意 S3 在 11dB 衰减下满量程约 3100mV 且顶部非线性，所以 3100 这个数
+// 同时也贴着 ADC 自己的天花板 —— 读到这个值意味着「要么传感器异常，要么 ADC 饱和」，
+// 两种都不该当数据用，所以合成一个 SOIL_RANGE 就够了。
+const int SOIL_OUT_MAX_MV = 3100;
+// 三态极差阈值：悬空约 3300mV，VH400 在位约 600mV，放中间。
+const int SOIL_FLOAT_SPREAD_MV = 1500;
+
+// 质量位用字符串而不是 enum，有个具体理由：本工程的 main.cpp 是当 .ino 编的
+// （getBatteryMv 在 302 行用、496 行才定义，靠 Arduino 预处理自动插原型才过），
+// 而那个预处理把原型插在【文件顶部】—— 任何用到 sketch 内自定义类型的函数签名
+// 都会在类型声明之前被解析，直接编译失败。
+// 两个调用点都只是把它原样写进记录行，没有分支用到类型安全，所以不值得为此
+// 另开一个头文件。取值：ok / absent / range。
 // ★ 2026-10-30：SD 卡四根线按 StarvedLogger_PCB.kicad_pcb 的网表改正。
 //
 // 【改之前是错的，而且错了三条】原来是 `SDcardPin = T12`（GPIO12）加裸
@@ -486,11 +510,84 @@ bool readTmp117(float& degC) {
   return true;
 }
 
-int getMoisture() {
-  int value = analogRead(sensor2Pin);
-  Serial.print("Soil moisture raw value: ");
-  Serial.println(value);
-  return value;
+// ★ 2026-11-09：VH400 电压 → 体积含水量(VWC %)。
+//
+// 官方分段线性曲线，抄自 vegetronix.com/Products/VH400/VH400-Piecewise-Curve
+// 【是 5 段不是 4 段】—— 官方页面自己把标题写成 "4 segents"（原文拼写如此），
+// 但下面实际列了 5 条方程。网上到处转载的版本普遍漏掉最后一段。
+//
+// 最后一段官方明确标注是近似值：">50% VWC"，而且页面说"多数土壤持水量低于
+// 50%，所以曲线到 2.2V 为止"。2.2V 以上的读数要当估计值看，不要当测量值。
+// 【已验算】四个接缝两侧最大差 0.014%，0~3V 全程单调，端点落在 10/15/40/50/100%
+// 这些整数上 —— 系数抄错任何一个都会让接缝跳开，所以这是个有效的自检。
+//
+// 【会返回负值】0.1V 以下官方公式给负数（0V → -1.00%）。【故意不截断】：
+// 截断到 0 是造数据，而负值本身是有信息的 ——「读数在曲线干端以下」。
+// 下游看到 -1% 不是 bug，是传感器在干透的土里或空气中。
+float vh400VwcPercent(float v) {
+  if (v < 0.0f)  v = 0.0f;
+  if (v <= 1.10f) return 10.00f * v -  1.00f;
+  if (v <= 1.30f) return 25.00f * v - 17.50f;
+  if (v <= 1.82f) return 48.08f * v - 47.50f;
+  if (v <= 2.20f) return 26.32f * v -  7.89f;
+  return               62.50f * v - 87.50f;   // >50% VWC，官方标注为近似
+}
+
+// ★ 2026-11-09：读 VH400，带在位检测。
+//
+// 【为什么必须有在位检测】悬空的 GPIO14 实测稳定返回 raw≈1189（约 0.96V），
+// 这个值【正好落在 VH400 的有效量程中段】，换算出来约 8.6% VWC —— 看着完全
+// 像一条正常数据。光看数值永远分不出「传感器在工作」和「线掉了」。
+// 这是本项目栽过五次的同一个形状：「调用没报错」≠「动作生效了」。
+//
+// 【判据：三态极差】给引脚加片内上拉/下拉（约 45k）各读一次：
+//   · 悬空        → 下拉拉到 ~0V，上拉拉到 ~3.3V，极差约 3300mV
+//   · VH400 在位  → 输出阻抗 10k，被 45k 拉动有限，极差约 10/55*3300 ≈ 600mV
+// 5 倍差距，阈值放 1500mV 很宽裕。这个方法在本板上有实测依据：2026-10-29
+// 的三态扫描里，悬空脚极差都在千级，低阻驱动的脚极差≈0（见 hardware/PINOUT.md）。
+//
+// 这项检查【每轮都做】而不是只在开机做一次 —— 松线是会在运行中发生的，
+// AS7343 那次就是这么耗掉大半天的。每轮多 3 次 analogRead，成本可以忽略。
+const char* readSoilMoisture(int& mv, float& vwcPct) {
+  mv = 0;
+  vwcPct = 0.0f;
+
+  pinMode(soilAdcPin, INPUT_PULLDOWN);
+  int vDown = (int)analogReadMilliVolts(soilAdcPin);
+  pinMode(soilAdcPin, INPUT_PULLUP);
+  int vUp   = (int)analogReadMilliVolts(soilAdcPin);
+  pinMode(soilAdcPin, INPUT);
+  int spread = vUp - vDown;
+
+  if (spread > SOIL_FLOAT_SPREAD_MV) {
+    Serial.printf("[SOIL] 悬空：三态极差 %dmV > %dmV（下拉 %d / 上拉 %d）—— 线没接或掉了\n",
+                  spread, SOIL_FLOAT_SPREAD_MV, vDown, vUp);
+    return "absent";
+  }
+
+  // VH400 输出阻抗 10k，对 SAR ADC 偏高：采样电容充不满会让第一次读数偏低。
+  // 丢掉第一次，再取 5 次的中位数（中位数而非均值 —— 对偶发尖刺不敏感）。
+  (void)analogReadMilliVolts(soilAdcPin);
+  int samples[5];
+  for (int i = 0; i < 5; i++) {
+    samples[i] = (int)analogReadMilliVolts(soilAdcPin);
+  }
+  for (int i = 1; i < 5; i++) {              // 插入排序，5 个元素不值得上 qsort
+    int key = samples[i], j = i - 1;
+    while (j >= 0 && samples[j] > key) { samples[j + 1] = samples[j]; j--; }
+    samples[j + 1] = key;
+  }
+  mv = samples[2];
+
+  if (mv > SOIL_OUT_MAX_MV) {
+    Serial.printf("[SOIL] 超量程：%dmV > VH400 输出上限 %dmV（三态极差 %dmV）\n",
+                  mv, SOIL_OUT_MAX_MV, spread);
+    return "range";
+  }
+
+  vwcPct = vh400VwcPercent((float)mv / 1000.0f);
+  Serial.printf("[SOIL] %dmV -> VWC %.1f%%（三态极差 %dmV）\n", mv, vwcPct, spread);
+  return "ok";
 }
 
 int getBatteryMv() {
@@ -637,7 +734,9 @@ String getDisplayStorageLabel() {
 }
 
 String buildMeasurementRecord(
-  int moisture,
+  int soilMv,
+  float vwcPct,
+  const char* soilQ,
   int batteryMv,
   float temperatureC,
   float humidity,
@@ -673,8 +772,21 @@ String buildMeasurementRecord(
   record += DISPLAY_SENSOR_TYPE;
   record += ",sample_count=";
   record += String(sampleCounter);
-  record += ",moisture=";
-  record += String(moisture);
+  // ★ 2026-11-09：moisture= 换成三个字段。
+  //
+  // 【为什么改名而不是沿用 moisture=】旧字段装的是 12bit 原始 ADC 码（0~4095），
+  // 新的装毫伏。如果沿用同一个名字，下游解析脚本会把 900mV 当成原始码 900
+  // 继续算，不报错、结果全错。改名是让下游【必须注意到】语义变了。
+  //
+  // 【为什么原始 mV 和 VWC 都留】vwc_pct 是用官方分段曲线从 soil_mv 推导的。
+  // 曲线将来可能要按本地土壤标定（官方曲线是通用土），原始电压丢了就没法重算。
+  // 原则：落盘保留测量值，推导值可以重算。
+  record += ",soil_mv=";
+  record += String(soilMv);
+  record += ",vwc_pct=";
+  record += (strcmp(soilQ, "ok") == 0) ? String(vwcPct, 1) : String("nan");
+  record += ",soil_q=";
+  record += soilQ;
   record += ",voltage_mv=";
   record += String(batteryMv);
   // ★ A7：显式的数据质量位。
@@ -1062,7 +1174,7 @@ void setup() {
   delay(SENSOR_RAIL_SETTLE_MS);
 
   analogReadResolution(12);
-  analogSetPinAttenuation(sensor2Pin, ADC_11db);
+  analogSetPinAttenuation(soilAdcPin, ADC_11db);
   analogSetPinAttenuation(batteryAdcPin, ADC_11db);
   printWakeupReason();
 
@@ -1173,7 +1285,9 @@ void loop() {
     delay(500);
     initializeLoggerPeripherals();
 
-    int moisture = getMoisture();
+    int soilMv = 0;
+    float vwcPct = 0.0f;
+    const char* soilQ = readSoilMoisture(soilMv, vwcPct);
     int batteryMv = getBatteryMv();
     if (batteryShouldShutdown(batteryMv)) {
       enterLowBatteryShutdown(batteryMv);   // 在写卡【之前】判，确保还有电落盘
@@ -1191,7 +1305,9 @@ void loop() {
     if (sampleCounter % RECORD_EVERY_SAMPLE_COUNT == 0) {
       if (isStorageReady()) {
         String record = buildMeasurementRecord(
-          moisture,
+          soilMv,
+          vwcPct,
+          soilQ,
           batteryMv,
           temperatureC,
           humidity,

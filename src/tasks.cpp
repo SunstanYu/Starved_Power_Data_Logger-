@@ -47,11 +47,12 @@
 #include "esp_task_wdt.h"
 
 // main.cpp 里的采样 / 存储原语
-extern int getMoisture();
+extern const char* readSoilMoisture(int& mv, float& vwcPct);
 extern int getBatteryMv();
 extern bool readDht11(float& temperatureC, float& humidity);
 extern int readSpectralChannels(uint16_t* channels, size_t channelCapacity);
-extern String buildMeasurementRecord(int moisture, int batteryMv, float temperatureC,
+extern String buildMeasurementRecord(int soilMv, float vwcPct, const char* soilQ,
+                                     int batteryMv, float temperatureC,
                                      float humidity, bool dhtOk,
                                      const uint16_t* spectralChannels, int spectralCount,
                                      float boardTempC, bool tmpOk);
@@ -177,7 +178,9 @@ static void sensorTask(void*) {
     setPeripheralSwitches(true);
     vTaskDelay(pdMS_TO_TICKS(500));          // 外设上电稳定
 
-    int moisture  = getMoisture();
+    int soilMv = 0;
+    float vwcPct = 0.0f;
+    const char* soilQ = readSoilMoisture(soilMv, vwcPct);
     int batteryMv = getBatteryMv();
     float t = 0.0f, h = 0.0f;
     bool dhtOk = readDht11(t, h);            // ← 这里会阻塞 ~2.5s，Net 任务照跑
@@ -187,7 +190,7 @@ static void sensorTask(void*) {
 
     setPeripheralSwitches(false);
 
-    String rec = buildMeasurementRecord(moisture, batteryMv, t, h, dhtOk,
+    String rec = buildMeasurementRecord(soilMv, vwcPct, soilQ, batteryMv, t, h, dhtOk,
                                         spectralChannels, n, boardTempC, tmpOk);
     publishLatest(rec);                      // 网页立刻就能看到，不用等落盘
 

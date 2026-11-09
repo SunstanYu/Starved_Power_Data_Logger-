@@ -96,7 +96,12 @@ static String buildLatestPanels() {
     return "<section class='panel'><h2>Latest Sample</h2><p class='muted'>No data has been written yet.</p></section>";
   }
 
-  String moisture = getFieldValue(record, "moisture");
+  // ★ 2026-11-09：moisture（原始 ADC 码）→ vwc_pct + soil_q。
+  // 字段名跟着 buildMeasurementRecord 一起改了，这里不改就是读到空字符串、
+  // 卡片显示空白 —— 不报错，所以必须手动跟。
+  String vwcPct = getFieldValue(record, "vwc_pct");
+  String soilQ = getFieldValue(record, "soil_q");
+  String soilMv = getFieldValue(record, "soil_mv");
   String batteryMv = getFieldValue(record, "voltage_mv");
   if (batteryMv.length() == 0) {
     batteryMv = getFieldValue(record, "battery_mv");
@@ -108,7 +113,14 @@ static String buildLatestPanels() {
   String html;
   html += "<section class='panel'><h2>Latest Sample</h2>";
   html += "<div class='metrics'>";
-  html += buildMetricCard("Soil Moisture", moisture, "raw");
+  // 质量位不是 ok 就不显示数值 —— 显示一个推导自坏电压的 VWC 比显示 "--" 更糟。
+  // absent = 线掉了 / range = 超量程，两种都直接把原因摆在卡片上。
+  if (soilQ == "ok") {
+    html += buildMetricCard("Soil Moisture", vwcPct, "% VWC");
+    html += buildMetricCard("Soil Raw", soilMv, "mV");
+  } else {
+    html += buildMetricCard("Soil Moisture", soilQ.length() ? soilQ : "--", "");
+  }
   html += buildMetricCard("Battery", batteryMv, "mV");
   html += buildMetricCard("Temperature", tempC == "nan" ? "--" : tempC, "C");
   html += buildMetricCard("Humidity", humidity == "nan" ? "--" : humidity, "%");
